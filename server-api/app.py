@@ -277,22 +277,37 @@ def health_ssd():
 
 
 # ---------------------------------------------------------------- /health/updates
+def parse_updates(txt):
+    """update-notifier's motd text -> (regular updates, of which security, extra ESM fixes).
+
+    "0 updates can be applied immediately."
+    "2 of these updates are standard security updates."
+    "4 additional security updates can be applied with ESM Apps."   <- needs Ubuntu Pro, not pending
+    Older releases: "5 packages can be updated." / "2 updates are security updates."
+    """
+    updates = sec = esm = 0
+    for line in txt.splitlines():
+        m = re.match(r"\s*(\d+)\s", line)
+        if not m:
+            continue
+        n, low = int(m.group(1)), line.lower()
+        if "esm" in low or "ubuntu pro" in low:
+            esm += n
+        elif "can be applied immediately" in low or "packages can be updated" in low or "package can be updated" in low:
+            updates = n
+        elif "security" in low:
+            sec = n
+    return updates, sec, esm
+
+
 @cached(30)
 def health_updates():
     if MOCK:
-        return {"updates": 7, "security_updates": 2, "reboot_required": "no", "reboot_pkgs": None}
+        return {"updates": 7, "security_updates": 2, "esm_updates": 4, "reboot_required": "no", "reboot_pkgs": None}
     txt = read(f"{HOSTFS}/var/lib/update-notifier/updates-available")
-    updates = sec = None
+    updates = sec = esm = None
     if txt is not None:
-        updates, sec = 0, 0
-        for line in txt.splitlines():
-            m = re.match(r"\s*(\d+)\s", line)
-            if not m:
-                continue
-            if "security" in line.lower():
-                sec = int(m.group(1))
-            elif "can be applied" in line or "updates can be" in line or "update can be" in line:
-                updates = int(m.group(1))
+        updates, sec, esm = parse_updates(txt)
     rr = None
     for p in (f"{HOSTFS}/run/reboot-required", f"{HOSTFS}/var/run/reboot-required"):
         if os.path.isdir(os.path.dirname(p)):
@@ -300,7 +315,7 @@ def health_updates():
             if rr:
                 break
     pkgs = read(f"{HOSTFS}/run/reboot-required.pkgs")
-    return {"updates": updates, "security_updates": sec,
+    return {"updates": updates, "security_updates": sec, "esm_updates": esm,
             "reboot_required": None if rr is None else ("yes" if rr else "no"),
             "reboot_pkgs": ", ".join(pkgs.split()) if pkgs else None}
 
@@ -471,20 +486,23 @@ def docker():
         names = [("pvt-discord-bot", 62e6, 0), ("mc-discord-bot", 58e6, 1), ("mcpanel", 41e6, 0),
                  ("beszel", 24e6, 0), ("beszel-agent", 12e6, 0), ("immich_server", 410e6, 0),
                  ("immich_postgres", 120e6, 0), ("immich_redis", 9e6, 0), ("extraction-service", 35e6, 2),
-                 ("homelab-dashboard", 24e6, 0)]
+                 ("homelab-dashboard", 18e6, 0), ("mc-2", 1.4e9, 0), ("mc-1", 0, 0), ("mc-server", 0, 0)]
         cs = []
         for n, m, r in names:
             m = int(jitter(m))
             cs.append({"name": n, "state": "running", "status": "Up 12 days", "uptime": "12d 4h", "restarts": r,
-                       "mem_bytes": m, "mem": human_bytes(m), "summary": f"up 12d 4h · {human_bytes(m)} · {r} restarts"})
-        cs[8].update(state="exited", status="Exited (0) 3 days ago", uptime=None, mem_bytes=0, mem="0 B",
-                     summary="exited")
+                       "mem_bytes": m, "mem": human_bytes(m), "summary": f"up 12d 4h · {human_bytes(m)} · {r} restarts",
+                       "world": n in ("mc-1", "mc-2"), "image": "itzg/minecraft-server" if n.startswith("mc-") else ""})
+        for i, status in ((8, "Exited (0) 3 days ago"), (11, "Exited (0) 2 days ago"), (12, "Exited (143) 5 days ago")):
+            cs[i].update(state="exited", status=status, uptime=None, mem_bytes=0, mem="0 B", summary="exited")
+        cs[10]["uptime"] = "3h 12m"
     else:
         cs = []
         for c in docker_get("/containers/json?all=1"):
             name = (c.get("Names") or ["?"])[0].lstrip("/")
             item = {"name": name, "state": c.get("State"), "status": c.get("Status"),
-                    "uptime": None, "restarts": None, "mem_bytes": None, "mem": None}
+                    "uptime": None, "restarts": None, "mem_bytes": None, "mem": None,
+                    "world": (c.get("Labels") or {}).get("mcpanel") == "1", "image": c.get("Image") or ""}
             try:
                 info = docker_get(f"/containers/{c['Id']}/json")
                 item["restarts"] = info.get("RestartCount")
@@ -507,9 +525,13 @@ def docker():
                 item["summary"] = item["status"]
             cs.append(item)
         cs.sort(key=lambda x: (x["state"] != "running", x["name"]))
+    for c in cs:  # stopped Minecraft worlds (MC Panel) and the manual ignore list are off on purpose
+        c["off_ok"] = c["state"] != "running" and (c["world"] or c["name"] in IGNORE_STOPPED)
     df = docker_df()
     running = sum(1 for c in cs if c["state"] == "running")
-    return {"running": running, "total": len(cs), "containers": cs,
+    down = [c["name"] for c in cs if c["state"] != "running" and not c["off_ok"]]
+    return {"running": running, "total": len(cs), "containers": cs, "down": down,
+            "expected": len(cs) - sum(1 for c in cs if c["off_ok"]),
             "disk_images": df.get("images"), "disk_volumes": df.get("volumes"),
             "disk_build_cache": df.get("build_cache"), "disk_reclaimable": df.get("reclaimable"),
             "disk_total": sum(df.get(k) or 0 for k in ("images", "containers", "volumes", "build_cache"))
@@ -735,21 +757,22 @@ def attention_items():
     if ok(u):
         if u.get("reboot_required") == "yes":
             items.append((WARN, "Restart needed", u.get("reboot_pkgs") or "after updates"))
-        if u.get("security_updates"):
-            items.append((WARN, "Security updates waiting", f"{u['security_updates']} of {u.get('updates')} updates"))
+        n, sec_n = u.get("updates") or 0, u.get("security_updates") or 0
+        if n:
+            items.append((WARN, "Updates waiting", f"{n} update{'s' if n != 1 else ''}" + (f", {sec_n} security" if sec_n else "")))
     sec = security()
     if ok(sec):
         f = sec.get("failed_ssh_24h")
         if f:
             items.append((lvl(f, 1, 20), "Failed SSH logins", f"{f} in the last 24 h"))
         if sec.get("ufw") == "disabled":
-            items.append((BAD, "Firewall is off", "ufw disabled"))
+            items.append((WARN, "Firewall is off", "ufw disabled, low risk at home"))
         if sec.get("playit") == "stopped":
             items.append((BAD, "playit tunnel is down", "playitd not running"))
     d = docker()
     if ok(d):
         for c in d["containers"]:
-            if c["state"] != "running" and c["name"] not in IGNORE_STOPPED:
+            if c["name"] in d["down"]:
                 items.append((BAD, f"{c['name']} is down", c.get("status") or "stopped"))
     tr = tracker()
     if ok(tr) and tr.get("status") in ("stopped", "stale"):
@@ -856,10 +879,10 @@ PANEL_RENDERERS = {
     "traffic": lambda: panels.panel_traffic(traffic(), *_rows_with_live()),
     "immich": lambda: panels.panel_immich(immich()),
     "bots": lambda: panels.panel_bots(docker(), tracker(), github()),
-    "docker": lambda: panels.panel_docker(docker(), IGNORE_STOPPED),
+    "docker": lambda: panels.panel_docker(docker()),
     "security": lambda: panels.panel_security(security()),
     "home": lambda: panels.panel_home(health_system(), health_battery(), history(), energy(), *_rows_with_live(),
-                                      traffic(), docker(), immich(), github(), attention_items(), IGNORE_STOPPED),
+                                      traffic(), docker(), immich(), github(), attention_items()),
     "links": lambda: panels.panel_links(),
 }
 

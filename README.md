@@ -23,7 +23,7 @@ yesterday or last month.
 | **Power and cost** | Energy used today (and the pace vs yesterday), yesterday, expected bill this month (vs last month), average power draw in watts. 7-day chart with ₹ per day and a 30-day chart with an average line. Priced at ₹5/kWh. |
 | **Traffic** | Data received and sent today, yesterday and this month, with trends. 7-day and 30-day download/upload charts. Includes home-network transfers (e.g. Immich uploads), so it is **not** the same as internet usage. |
 | **Immich** | Photo and video counts, library size, background processing queue, free space on the photo disk. |
-| **Bots and automation** | pvt-discord-bot and mc-discord-bot (running, uptime, memory, restarts), the energy tracker service, the GitHub runner and the latest deploy. |
+| **Bots and automation** | pvt-discord-bot and mc-discord-bot (running, uptime, memory, restarts), the energy tracker service, the GitHub runner and the latest deploy, and the Minecraft worlds created in MC Panel. |
 | **Docker** | Every container with state, uptime, memory and restart count. Docker disk use (images, volumes, build cache) and how much `docker system prune` could free. |
 | **Security** | Failed SSH logins in the last 24 h, firewall (ufw) on/off, playit tunnel running. |
 | **Links** | MC Panel, Beszel, Immich, GitHub, playit.gg, Discord. |
@@ -63,8 +63,13 @@ browser ──► :3000  homelab-dashboard container (Python)
   crash the page.
 - CPU/memory/temperature history is kept in memory for 24 hours, so that chart starts
   empty after a restart.
-- `extraction-service` is stopped on purpose, so it doesn't raise an alert
-  (`IGNORE_STOPPED_CONTAINERS` in `docker-compose.yml`).
+- Stopped containers raise an alert, except:
+  - Minecraft worlds created by MC Panel (Docker label `mcpanel=1`). They show as
+    "Stopped (world, managed by MC Panel)" and are listed under Bots and automation.
+  - Names in `IGNORE_STOPPED_CONTAINERS` in `docker-compose.yml` (currently
+    `extraction-service`).
+- Updates only alert for regular pending updates or a needed restart. Extra Ubuntu Pro
+  (ESM) security fixes are shown as optional information.
 
 ## Repository layout
 

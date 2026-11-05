@@ -325,19 +325,21 @@ def panel_health(sysd, bat, ssd, upd, history):
                       lv if t2 is not None else None,
                       "The storage drive. Under 60 °C is healthy."))
     u = upd if ok_dict(upd) else {}
-    n, sec, rr = u.get("updates"), u.get("security_updates"), u.get("reboot_required")
-    lv_u = None if n is None else ("warn" if sec else "ok")
+    n, sec, rr, esm = u.get("updates"), u.get("security_updates"), u.get("reboot_required"), u.get("esm_updates")
+    lv_u = None if n is None else ("warn" if n else "ok")
     lv_r = None if rr is None else ("warn" if rr == "yes" else "ok")
     worst = "warn" if "warn" in (lv_u, lv_r) else ("ok" if lv_u or lv_r else None)
     cards.append(card("Updates and restarts", "package-up",
                       big("Up to date" if n == 0 else (n if n is not None else "—"), "" if n == 0 else "updates waiting", lv_u)
                       + '<div class="rows">'
-                      + row("Security updates", "none" if not sec else f"{sec} waiting", "warn" if sec else ("ok" if sec == 0 else None))
+                      + row("Of these, security", "none" if not sec else f"{sec}", "warn" if sec else ("ok" if sec == 0 else None))
+                      + (row("With Ubuntu Pro", f"{esm} extra security fixes (optional)") if esm else "")
                       + row("Restart needed", "Yes" + (f" ({esc(u['reboot_pkgs'])})" if u.get("reboot_pkgs") else "") if rr == "yes" else ("No" if rr == "no" else "—"), lv_r)
                       + row("Last restart", f"{when(s.get('last_reboot'))} · {ago(s.get('last_reboot')) or ''}")
                       + row("Running for", duration(s.get("uptime_seconds")))
                       + "</div>",
-                      worst, "Install updates with <code>sudo apt upgrade</code>. Security updates matter most.",
+                      worst, "Install updates with <code>sudo apt update && sudo apt upgrade</code>. "
+                      "Ubuntu Pro (ESM) fixes are extra and optional; they are not counted as waiting updates.",
                       ))
     top = s.get("top_processes") or []
     mx = max([p["cpu"] for p in top] + [1])
@@ -374,11 +376,13 @@ def panel_power(e, rows, live, rate, base_watts=9):
     yk = e.get("yesterday_kwh")
     cards = []
     sub = f"₹{e['today_cost_inr']:.2f} so far" if e.get("today_cost_inr") is not None else "No live reading yet"
+    live_note = (f"Last reading {ago(live.get('updated_at'))}." if live and live.get("updated_at")
+                 else "Apply the energy-tracker patch (see the README) to see today's live numbers.")
     cards.append(card("Today so far", "flash", big(f"{tk:.2f}" if tk is not None else "—", "kWh", None, sub)
                       + (trend(pace, yk, "yesterday") if pace else "")
                       + (f'<div class="sub" style="margin-top:6px;font-size:12.5px">On pace for about {pace:.2f} kWh today</div>' if pace else "")
                       + spark([r["total_kwh"] for r in ydays[-14:]] + ([pace] if pace else [])),
-                      "none", f"Electricity the server used today, estimated at ₹{rate:g}/kWh. Last reading {ago((live or {}).get('updated_at')) or 'unknown'}."))
+                      "none", f"Electricity the server used today, estimated at ₹{rate:g}/kWh. {live_note}"))
     cards.append(card("Yesterday", "calendar-arrow-left", big(f"{yk:.2f}" if yk is not None else "—", "kWh", None,
                                                               f"₹{e['yesterday_cost_inr']:.2f}" if e.get("yesterday_cost_inr") is not None else "")
                       + (trend(yk, ydays[-2]["total_kwh"] if len(ydays) >= 2 else None, "the day before") if yk is not None else ""),
@@ -544,16 +548,26 @@ def panel_bots(d, tr, g):
                       lv_d if lv == "ok" else lv,
                       "Pushing to main on GitHub makes this laptop rebuild that app automatically." +
                       (f' <span style="color:{WARNC}">{esc(g["error"])}</span>' if g.get("error") else "")))
+    worlds = [c for c in (d.get("containers") or []) if c.get("world")] if ok_dict(d) else []
+    up = sum(1 for w in worlds if w["state"] == "running")
+    rows_ = "".join(row(esc(w["name"]), (f"Running · up {esc(w.get('uptime') or '?')} · {gb(w.get('mem_bytes'))} RAM"
+                                         if w["state"] == "running" else "Stopped (managed by MC Panel)"),
+                        "ok" if w["state"] == "running" else None) for w in worlds)
+    cards.append(card("Minecraft worlds", "minecraft",
+                      big(f"{up} of {len(worlds)}", "running", None, "worlds created in MC Panel") + f'<div class="rows">{rows_}</div>'
+                      if worlds else big("None", "", None, "no MC Panel worlds found"),
+                      "none", "Each world is its own container, started and stopped from MC Panel. "
+                      "A stopped world is normal and never raises an alert.", span=4))
     return page("bots", f'<div class="grid">{"".join(cards)}</div>')
 
 
 # ------------------------------------------------------------------ Docker
-def panel_docker(d, ignore):
+def panel_docker(d):
     if not ok_dict(d):
         return page("docker", card("Docker", "docker", big("Unavailable", "", "bad"), "bad",
                                    esc(str((d or {}).get("error", ""))), span=4))
     cs = d["containers"]
-    unexpected = [c for c in cs if c["state"] != "running" and c["name"] not in ignore]
+    unexpected = d.get("down") or []
     lv = "bad" if unexpected else "ok"
     total_mem = sum(c.get("mem_bytes") or 0 for c in cs)
     mx = max([c.get("mem_bytes") or 0 for c in cs] + [1])
@@ -561,10 +575,13 @@ def panel_docker(d, ignore):
     for c in cs:
         if c["state"] == "running":
             clv = "warn" if c.get("restarts") else "ok"
-            st = "Running"
+            st = "Running" + (" (world)" if c.get("world") else "")
+        elif c.get("world"):
+            clv, st = None, "Stopped (world, managed by MC Panel)"
+        elif c.get("off_ok"):
+            clv, st = None, "Stopped (on purpose)"
         else:
-            clv = "warn" if c["name"] in ignore else "bad"
-            st = "Stopped" + (" (on purpose)" if c["name"] in ignore else "")
+            clv, st = "bad", "Stopped"
         mem = c.get("mem_bytes")
         trs.append(f'<tr><td><span class="dot" style="--c:{LEVEL_COLOUR[clv]}"></span>{esc(c["name"])}</td>'
                    f'<td>{st}</td><td>{esc(c.get("uptime") or "—")}</td>'
@@ -578,16 +595,17 @@ def panel_docker(d, ignore):
     seg = "".join(f'<i style="width:{(v or 0) / tot * 100:.1f}%;background:{c};border-radius:0"></i>' for _, v, c in parts)
     leg = "".join(f'<div class="row"><span class="k"><span class="dot" style="--c:{c}"></span>{n}</span><span class="v">{gb(v)}</span></div>' for n, v, c in parts)
     cards = [
-        card("Apps running", "docker", big(f"{d['running']} of {d['total']}", "running", lv,
-                                           ("Down: " + ", ".join(esc(c["name"]) for c in unexpected)) if unexpected else "Everything that should run is running")
-             + bar(d["running"] / max(d["total"], 1) * 100, lv), lv, "Each app on the server runs in its own Docker container."),
+        card("Apps running", "docker", big(f"{d['running']} of {d['expected']}", "running", lv,
+                                           ("Down: " + ", ".join(esc(n) for n in unexpected)) if unexpected else "Everything that should run is running")
+             + bar(d["running"] / max(d["expected"], 1) * 100, lv), lv,
+             "Each app runs in its own Docker container. Stopped Minecraft worlds and apps switched off on purpose are not counted."),
         card("Memory used by apps", "memory", big(gb(total_mem), "", None, "all containers together"),
              "none", "The server has about 7.6 GB. Immich is usually the biggest user."),
         card("Docker disk use", "harddisk", big(gb(d.get("disk_total")), "", None)
              + f'<div class="bar" style="display:flex;margin-top:10px">{seg}</div><div class="rows" style="margin-top:8px">{leg}</div>',
              "none", f"<b>{gb(d.get('disk_reclaimable'))}</b> could be freed with <code>docker system prune</code> (unused images and cache).", span=2),
         card("All containers", "format-list-bulleted", table, "none",
-             "Green = running fine · amber = restarted at least once, or stopped on purpose · red = stopped unexpectedly.", span=4),
+             "Green = running fine · amber = restarted at least once · grey = stopped on purpose (incl. MC Panel worlds) · red = stopped unexpectedly.", span=4),
     ]
     return page("docker", f'<div class="grid">{"".join(cards)}</div>')
 
@@ -598,7 +616,7 @@ def panel_security(s):
     f = s.get("failed_ssh_24h")
     lv = None if f is None else ("ok" if f == 0 else level(f, 1, 20))
     ufw = s.get("ufw")
-    lv_f = {"enabled": "ok", "disabled": "bad"}.get(ufw)
+    lv_f = {"enabled": "ok", "disabled": "warn"}.get(ufw)
     pl = s.get("playit")
     lv_p = {"running": "ok", "stopped": "bad"}.get(pl)
     cards = [
@@ -607,7 +625,10 @@ def panel_security(s):
              lv, "Each one is a login to the server that failed. A few could be you mistyping; many in a short time means someone is guessing passwords.",
              span=2),
         card("Firewall", "wall-fire", big({"enabled": "On", "disabled": "Off"}.get(ufw, "—"), "", lv_f, "ufw"),
-             lv_f, "Blocks connections to ports you have not opened. It should always be on."),
+             lv_f, "Blocks connections to ports you have not opened. " + (
+                 "Off is low risk on a home network behind your router, and ports published by Docker skip ufw anyway. "
+                 "To turn it on: <code>sudo ufw allow OpenSSH</code> then <code>sudo ufw enable</code>."
+                 if ufw == "disabled" else "Note: ports published by Docker skip ufw rules.")),
         card("playit tunnel", "tunnel", big({"running": "Running", "stopped": "Not running"}.get(pl, "—"), "", lv_p, "playitd"),
              lv_p, "Lets friends outside your home join the Minecraft server. If it is down, they cannot connect."),
     ]
@@ -639,7 +660,7 @@ LINKS = [("MC Panel", "Minecraft server panel", "http://192.168.31.125:8081", "m
          ("GitHub", "swastik-labs", "https://github.com/swastik-labs", "github", "#e2e8f0")]
 
 
-def panel_home(sysd, bat, hist, e, rows, live, t, d, imm, g, attention, ignore):
+def panel_home(sysd, bat, hist, e, rows, live, t, d, imm, g, attention):
     s = sysd if ok_dict(sysd) else {}
     today = date.today().isoformat()
     ydays = [r for r in (rows or []) if r["date"] < today]
@@ -693,7 +714,8 @@ def panel_home(sysd, bat, hist, e, rows, live, t, d, imm, g, attention, ignore):
     tot = tt.get("today_total")
     tpace = tot / hours * 24 if tot and hours > 1 else None
     power = tile("power", "Power today", "flash", f"{tk:.2f}" if tk is not None else "—", "kWh", None, None,
-                 f"₹{e.get('today_cost_inr') or 0:.2f} so far · bill ≈ ₹{e.get('projected_bill_inr') or 0:.0f}/month",
+                 (f"₹{e.get('today_cost_inr') or 0:.2f} so far · bill ≈ ₹{e.get('projected_bill_inr') or 0:.0f}/month"
+                  if tk is not None else "No live reading: apply the energy-tracker patch"),
                  extra=trend(pace, yk, "yesterday") if pace else "",
                  sparkline=spark([r["total_kwh"] for r in ydays[-14:]] + ([pace] if pace else [])))
     traffic = tile("traffic", "Traffic today", "swap-vertical", gb(tot) if tot is not None else "—", "", None, None,
@@ -701,8 +723,7 @@ def panel_home(sysd, bat, hist, e, rows, live, t, d, imm, g, attention, ignore):
                    extra=trend(tpace, tt.get("yesterday_total"), "yesterday", neutral=True) if tpace else "",
                    sparkline=spark([(r["rx_bytes"] or 0) + (r["tx_bytes"] or 0) for r in ydays[-14:]]))
     if ok_dict(d):
-        down = [c["name"] for c in d["containers"] if c["state"] != "running" and c["name"] not in ignore]
-        expected = d["total"] - sum(1 for c in d["containers"] if c["state"] != "running" and c["name"] in ignore)
+        down, expected = d.get("down") or [], d.get("expected") or d["total"]
         lv_c = "bad" if down else "ok"
         cont = tile("docker", "Apps running", "docker", f"{d['running']}/{expected}", "", lv_c, d["running"] / max(expected, 1) * 100,
                     ("Down: " + ", ".join(down)) if down else "Every app is up")
