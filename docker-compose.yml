@@ -1,0 +1,29 @@
+name: homelab-dashboard
+
+# One small container: the Python server-api serves both the dashboard page (web/) and its data.
+services:
+  dashboard:
+    build: ./server-api
+    image: homelab-dashboard:latest
+    container_name: homelab-dashboard
+    restart: unless-stopped
+    ports:
+      - "3000:3000"   # http://192.168.31.125:3000 (home network)
+    pid: host         # see host processes (top programs, playitd, energy tracker)
+    read_only: true
+    cap_drop: [ALL]
+    cap_add: [DAC_READ_SEARCH]   # read root-only files (auth.log) without being able to write anything
+    security_opt: [no-new-privileges:true]
+    environment:
+      TZ: Asia/Kolkata
+      MOCK: "0"
+      IGNORE_STOPPED_CONTAINERS: extraction-service   # stopped on purpose, don't raise an alert
+      IMMICH_URL: http://192.168.31.125:2283
+      IMMICH_API_KEY: ${IMMICH_API_KEY:-}
+      DASH_GITHUB_TOKEN: ${DASH_GITHUB_TOKEN:-}
+      GITHUB_ORG: swastik-labs
+      GITHUB_RUNNER: homelab-laptop
+    volumes:
+      - /:/hostfs:ro,rslave
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    mem_limit: 64m

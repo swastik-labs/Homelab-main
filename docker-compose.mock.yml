@@ -1,0 +1,7 @@
+# PC testing with fake data: docker compose -f docker-compose.yml -f docker-compose.mock.yml up -d --build
+services:
+  dashboard:
+    pid: !reset null
+    environment:
+      MOCK: "1"
+    volumes: !reset []

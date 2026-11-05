@@ -1,0 +1,46 @@
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: homelab-dashboard-deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: self-hosted   # existing org runner "homelab-laptop"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Write .env from secrets
+        env:
+          IMMICH_API_KEY: ${{ secrets.IMMICH_API_KEY }}
+          DASH_GITHUB_TOKEN: ${{ secrets.DASH_GITHUB_TOKEN }}
+        run: |
+          umask 077
+          {
+            printf 'IMMICH_API_KEY=%s\n' "$IMMICH_API_KEY"
+            printf 'DASH_GITHUB_TOKEN=%s\n' "$DASH_GITHUB_TOKEN"
+          } > .env
+
+      - name: Deploy
+        run: docker compose up -d --build --remove-orphans
+
+      - name: Check the dashboard answers
+        run: |
+          for i in $(seq 1 20); do
+            if docker exec homelab-dashboard wget -qO- http://127.0.0.1:3000/healthz >/dev/null 2>&1; then
+              docker compose ps
+              exit 0
+            fi
+            sleep 3
+          done
+          docker compose logs --tail 50
+          exit 1
+
+      - name: Remove .env
+        if: always()
+        run: rm -f .env

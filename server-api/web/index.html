@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>swastikserver</title>
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/app.css">
+</head>
+<body>
+  <header class="top">
+    <a class="brand" href="#home">
+      <span class="logo"><svg viewBox="0 0 24 24" width="22" height="22"><path fill="currentColor" d="M4 5h16a1 1 0 0 1 1 1v9a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V6a1 1 0 0 1 1-1m1 2v7h14V7zM2 18h20v1.5H2z"/></svg></span>
+      <span><b>swastikserver</b><small>Home server dashboard</small></span>
+    </a>
+    <div class="live"><span class="pulse"></span><span id="stamp">Connecting…</span></div>
+  </header>
+  <nav class="tabs" id="tabs" aria-label="Sections"></nav>
+  <main>
+    <div class="sechead" id="sechead"></div>
+    <div id="view" aria-live="polite"><p class="empty">Loading…</p></div>
+  </main>
+  <script src="/app.js"></script>
+</body>
+</html>
