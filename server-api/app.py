@@ -26,6 +26,10 @@ ENERGY_DIR = os.environ.get("ENERGY_DIR", HOSTFS + "/home/swastik/energy-tracker
 DB_PATH = ENERGY_DIR + "/energy_tracker.db"
 LIVE_PATH = ENERGY_DIR + "/live.json"
 RATE_INR = float(os.environ.get("RATE_INR_PER_KWH", "5"))
+# The energy tracker counts internet-only traffic since this day (switched mid-day), so daily
+# rows up to and including it also contain home-network transfers. Mock mode puts it 6 days back.
+INTERNET_ONLY_SINCE = date.fromisoformat(os.environ.get("INTERNET_ONLY_SINCE")
+                                         or ((date.today() - timedelta(days=6)).isoformat() if MOCK else "2026-11-14"))
 DOCKER_SOCK = "/var/run/docker.sock"
 IMMICH_URL = os.environ.get("IMMICH_URL", "http://192.168.31.125:2283").rstrip("/")
 IMMICH_KEY = os.environ.get("IMMICH_API_KEY", "")
@@ -329,9 +333,12 @@ def db_rows(since):
         rnd = random.Random(42)
         while d < today:
             cpu = round(rnd.uniform(0.04, 0.09), 3)
+            internet = d > INTERNET_ONLY_SINCE  # before: home network included, so much bigger
+            rx = rnd.uniform(0.4e9, 1.6e9) if internet else rnd.uniform(1.5e9, 9e9)
+            tx = rnd.uniform(0.15e9, 0.6e9) if internet else rnd.uniform(0.4e9, 3e9)
             rows.append({"date": d.isoformat(), "cpu_kwh": cpu, "total_kwh": round(cpu + 0.216, 3),
                          "cost_inr": round((cpu + 0.216) * RATE_INR, 2),
-                         "rx_bytes": int(rnd.uniform(1.5e9, 9e9)), "tx_bytes": int(rnd.uniform(0.4e9, 3e9)), "hours": 24})
+                         "rx_bytes": int(rx), "tx_bytes": int(tx), "hours": 24})
             d += timedelta(days=1)
         return rows
     if not os.path.exists(DB_PATH):
@@ -357,8 +364,8 @@ def live():
         h = now.hour + now.minute / 60
         return {"date": date.today().isoformat(), "cpu_kwh_so_far": round(0.0028 * h, 4),
                 "total_kwh_so_far": round(0.0118 * h, 4), "cost_so_far": round(0.059 * h, 2),
-                "rx_bytes": int(2.2e8 * h), "tx_bytes": int(6e7 * h), "hours": round(h, 2),
-                "updated_at": now.astimezone().isoformat(timespec="seconds")}
+                "rx_bytes": int(4.2e7 * h), "tx_bytes": int(1.4e7 * h), "hours": round(h, 2),
+                "traffic_scope": "internet", "updated_at": now.astimezone().isoformat(timespec="seconds")}
     try:
         with open(LIVE_PATH) as f:
             d = json.load(f)
@@ -930,13 +937,13 @@ def _rows_with_live():
 PANEL_RENDERERS = {
     "health": lambda: panels.panel_health(health_system(), health_battery(), health_ssd(), health_updates(), history()),
     "power": lambda: panels.panel_power(energy(), *_rows_with_live(), RATE_INR),
-    "traffic": lambda: panels.panel_traffic(traffic(), *_rows_with_live()),
+    "traffic": lambda: panels.panel_traffic(traffic(), *_rows_with_live(), INTERNET_ONLY_SINCE),
     "immich": lambda: panels.panel_immich(immich()),
     "bots": lambda: panels.panel_bots(docker(), tracker(), github()),
     "docker": lambda: panels.panel_docker(docker()),
     "security": lambda: panels.panel_security(security()),
     "home": lambda: panels.panel_home(health_system(), health_battery(), history(), energy(), *_rows_with_live(),
-                                      traffic(), docker(), immich(), github(), attention_items(), links_data()),
+                                      traffic(), docker(), immich(), github(), attention_items(), links_data(), INTERNET_ONLY_SINCE),
     "links": lambda: panels.panel_links(links_data()),
 }
 

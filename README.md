@@ -18,10 +18,10 @@ yesterday or last month.
 
 | Tab | What you see |
 |---|---|
-| **Home** | Status banner ("All good" or "N things need attention", with each problem listed). Vital tiles with gauges: CPU temperature, CPU load, memory, disk, battery, uptime. Service tiles: power today vs yesterday, traffic today, apps running, Immich, GitHub runner and last deploy. Sparklines and quick links to every discovered app. Every tile opens its tab. |
+| **Home** | Status banner ("All good" or "N things need attention", with each problem listed). Vital tiles with gauges: CPU temperature, CPU load, memory, disk, battery, uptime. Service tiles: power today vs yesterday, internet used today, apps running, Immich, GitHub runner and last deploy. Sparklines and quick links to every discovered app. Every tile opens its tab. |
 | **Server health** | Processor load, temperature, memory and disk with gauges and sparklines. A 24-hour history chart (load, memory, temperature). Battery charge and health, SSD temperature, pending updates and whether a restart is needed, last restart, busiest programs. |
 | **Power and cost** | Energy used today (and the pace vs yesterday), yesterday, expected bill this month (vs last month), average power draw in watts. 7-day chart with ₹ per day and a 30-day chart with an average line. Priced at ₹5/kWh. |
-| **Traffic** | Data received and sent today, yesterday and this month, with trends. 7-day and 30-day download/upload charts. Includes home-network transfers (e.g. Immich uploads), so it is **not** the same as internet usage. |
+| **Internet usage** | Only data to and from the internet, the part your ISP counts: today, yesterday and this month, with trends and the month's pace. 7-day and 30-day download/upload charts. Home transfers like Immich uploads aren't included. Days before the tracker switched to internet-only counting (see below) are shown grey. |
 | **Immich** | Photo and video counts, library size, background processing queue, free space on the photo disk. |
 | **Bots and automation** | pvt-discord-bot and mc-discord-bot (running, uptime, memory, restarts), the energy tracker service, the GitHub runner and the latest deploy, and the Minecraft worlds created in MC Panel. |
 | **Docker** | Every container with state, uptime, memory and restart count. Docker disk use (images, volumes, build cache) and how much `docker system prune` could free. |
@@ -109,6 +109,20 @@ labels:
   homelab.hide: "true"               # leave it out entirely
 ```
 
+## Internet usage vs older days
+
+The energy tracker counts **internet-only** traffic (nftables counters on the Wi-Fi interface
+that leave out home/LAN, Docker, Tailscale and the home IPv6 /64) since **14 Nov 2026, 1:05 pm**.
+Before that it counted everything through the Wi-Fi, home transfers included.
+
+- `INTERNET_ONLY_SINCE` in `docker-compose.yml` (`2026-11-14`) is that switch day. Daily rows
+  up to and including it are shown grey as "includes home network". Later days count as
+  internet-only.
+- Today's live number counts as internet-only when `live.json` has
+  `"traffic_scope": "internet"`.
+- Month totals, pace and trends only use internet-only days, so they never compare internet
+  traffic with older home-inclusive numbers. Older days this month are listed separately.
+
 ## Repository layout
 
 ```
@@ -165,7 +179,7 @@ git-ignored.
 
 ## Energy tracker patch (`live.json`)
 
-The Power and Traffic pages read finished days from
+The Power and Internet usage pages read finished days from
 `/home/swastik/energy-tracker/energy_tracker.db` (table `daily_reports`). The tracker keeps
 today's running totals only in memory, so add this small patch to
 `/home/swastik/energy-tracker/energy_report.py`. It writes `live.json` atomically on every
