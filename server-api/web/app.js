@@ -36,6 +36,18 @@
 
   const clock = (d) => d.toLocaleTimeString([], { hour: "numeric", minute: "2-digit", second: "2-digit" });
 
+  // Discovered app links carry only a port; the address is whatever this page was opened with,
+  // so the same links work at home (192.168.31.125) and over Tailscale.
+  function fillLinks(root) {
+    const host = location.hostname;
+    root.querySelectorAll("a[data-port]").forEach((a) => {
+      const scheme = a.dataset.scheme === "https" ? "https" : "http";
+      const path = (a.dataset.path || "/").startsWith("/") ? a.dataset.path || "/" : "/";
+      a.href = `${scheme}://${host}:${a.dataset.port}${path}`;
+      a.querySelectorAll("[data-hostport]").forEach((s) => { s.textContent = `${host}:${a.dataset.port}`; });
+    });
+  }
+
   async function load(first) {
     const t = current, my = ++seq;
     try {
@@ -44,6 +56,7 @@
       const html = await r.text();
       if (my !== seq || t !== current) return;  // user switched tab meanwhile
       view.innerHTML = html;
+      fillLinks(view);
       lastOk = Date.now();
       stamp.textContent = `Live · updated ${clock(new Date())}`;
       document.body.classList.remove("stale");

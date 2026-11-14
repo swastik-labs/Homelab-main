@@ -18,7 +18,7 @@ yesterday or last month.
 
 | Tab | What you see |
 |---|---|
-| **Home** | Status banner ("All good" or "N things need attention", with each problem listed). Vital tiles with gauges: CPU temperature, CPU load, memory, disk, battery, uptime. Service tiles: power today vs yesterday, traffic today, apps running, Immich, GitHub runner and last deploy. Sparklines and quick links. Every tile opens its tab. |
+| **Home** | Status banner ("All good" or "N things need attention", with each problem listed). Vital tiles with gauges: CPU temperature, CPU load, memory, disk, battery, uptime. Service tiles: power today vs yesterday, traffic today, apps running, Immich, GitHub runner and last deploy. Sparklines and quick links to every discovered app. Every tile opens its tab. |
 | **Server health** | Processor load, temperature, memory and disk with gauges and sparklines. A 24-hour history chart (load, memory, temperature). Battery charge and health, SSD temperature, pending updates and whether a restart is needed, last restart, busiest programs. |
 | **Power and cost** | Energy used today (and the pace vs yesterday), yesterday, expected bill this month (vs last month), average power draw in watts. 7-day chart with ₹ per day and a 30-day chart with an average line. Priced at ₹5/kWh. |
 | **Traffic** | Data received and sent today, yesterday and this month, with trends. 7-day and 30-day download/upload charts. Includes home-network transfers (e.g. Immich uploads), so it is **not** the same as internet usage. |
@@ -26,7 +26,7 @@ yesterday or last month.
 | **Bots and automation** | pvt-discord-bot and mc-discord-bot (running, uptime, memory, restarts), the energy tracker service, the GitHub runner and the latest deploy, and the Minecraft worlds created in MC Panel. |
 | **Docker** | Every container with state, uptime, memory and restart count. Docker disk use (images, volumes, build cache) and how much `docker system prune` could free. |
 | **Security** | Failed SSH logins in the last 24 h, firewall (ufw) on/off, playit tunnel running. |
-| **Links** | MC Panel, Beszel, Immich, GitHub, playit.gg, Discord. |
+| **Links** | Found automatically from Docker and grouped (Apps, Minecraft, Monitoring, Projects, External), with a running/stopped dot and a NEW badge for apps first seen in the last 24 h. Minecraft worlds appear as status tiles. Home shows the same apps as quick-link buttons. |
 
 Pages refresh themselves every 15 to 30 seconds without reloading, and the header shows when
 the data was last updated.
@@ -37,7 +37,7 @@ the data was last updated.
   no Node.js, no build step. Charts are inline SVG; icons come from the Material Design
   Icons CDN.
 - **Backend:** one small Python 3.13 server using only the standard library
-  (`server-api/app.py`, `server-api/panels.py`).
+  (`server-api/app.py`, `server-api/panels.py`, `server-api/links.py`).
 - **One container**, about **18 MB RAM** and near-zero CPU when idle (measured with
   `docker stats`).
 
@@ -51,7 +51,7 @@ browser ──► :3000  homelab-dashboard container (Python)
                          / (mounted at /hostfs) . disk usage, apt updates, reboot-required,
                                                   /var/log/auth.log, /etc/ufw/ufw.conf,
                                                   energy-tracker SQLite DB + live.json
-                         /var/run/docker.sock ... containers, memory, disk usage
+                         /var/run/docker.sock ... containers, memory, disk usage, app links
                          Immich API ............. photo counts, storage, queue
                          GitHub API ............. org runner status, latest workflow run
 ```
@@ -71,6 +71,44 @@ browser ──► :3000  homelab-dashboard container (Python)
 - Updates only alert for regular pending updates or a needed restart. Extra Ubuntu Pro
   (ESM) security fixes are shown as optional information.
 
+## Links are found automatically
+
+Every ~30 s the dashboard lists the Docker containers. Each container that **publishes a
+host port** gets a link, built in the browser from the address you opened the dashboard
+with plus that host port. So the same links work at home (`192.168.31.125`) and over
+Tailscale, and no IP is hard-coded. For example, MC Panel publishes `8081 -> 8000`, so its
+link is `http://<this host>:8081`.
+
+- **Hidden automatically:** the dashboard itself, containers without published ports
+  (bots, `beszel-agent`, Immich's database and cache), ports bound to `127.0.0.1` only, and
+  database/cache images (postgres, redis, valkey, mysql, mariadb, mongo) even if they
+  publish a port.
+- **Known apps** get a proper name, description, icon, colour and group: Immich, Beszel,
+  MC Panel, Jellyfin, AdGuard Home, Vaultwarden, Dozzle, Dockge, Uptime Kuma, Navidrome,
+  Gitea, Forgejo, code-server, n8n, PocketBase, Umami, Excalidraw, IT-Tools. Anything else
+  (like `bunkers`) shows under **Projects** with its container name and a generic icon.
+- **Minecraft worlds** (label `mcpanel=1`, or the `itzg/minecraft-server` image) have no web
+  page, so they show as status tiles in the Minecraft group.
+- **NEW** marks apps first seen in the last 24 h. This is kept in memory, so right after
+  the dashboard restarts nothing is NEW.
+- **External** links (GitHub, playit.gg, Discord) are a short fixed list in
+  `server-api/links.py`.
+
+Override anything with Docker labels on the app's container (all optional):
+
+```yaml
+labels:
+  homelab.name: "Bunkers"
+  homelab.description: "Bunker planner"
+  homelab.icon: "shield-home"        # any Material Design Icons name
+  homelab.color: "#38bdf8"
+  homelab.group: "Projects"          # Apps, Minecraft, Monitoring, Projects, or your own
+  homelab.port: "3001"               # which host port, if it publishes several
+  homelab.path: "/admin"
+  homelab.scheme: "https"
+  homelab.hide: "true"               # leave it out entirely
+```
+
 ## Repository layout
 
 ```
@@ -80,6 +118,7 @@ server-api/
   Dockerfile
   app.py                    # data collection, caching, HTTP server
   panels.py                 # renders each tab (HTML + inline SVG charts)
+  links.py                  # finds app links from Docker; known-app catalog
   web/                      # index.html, app.css, app.js, favicon.svg
 .github/workflows/deploy.yml
 .env.example

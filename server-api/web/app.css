@@ -116,3 +116,17 @@ main{max-width:1360px;margin:0 auto;padding:6px 20px 40px}
 .issue{text-decoration:none}.issue:hover{filter:brightness(1.2)}
 .tile:focus-visible,.tabs a:focus-visible,.issue:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
 .lnk b{color:#f1f5f9}
+
+/* ---- discovered links ---- */
+.lnk{position:relative}
+.lnk .lt{min-width:0;display:flex;flex-direction:column}
+.lnk .lt b{display:flex;align-items:center;gap:8px}
+.newb{font-size:10px;font-weight:800;letter-spacing:.06em;color:#0b1220;background:#facc15;padding:1px 6px;border-radius:5px}
+.sdot{position:absolute;top:12px;right:12px;width:9px;height:9px;border-radius:50%;background:var(--c);
+  box-shadow:0 0 0 3px color-mix(in srgb,var(--c) 22%,transparent)}
+.stopped{position:absolute;bottom:10px;right:12px;font-size:11px;font-weight:700;color:#f87171}
+.lnk.world{cursor:default}
+.lgroup{margin-bottom:22px}
+.lgroup h2{display:flex;align-items:center;gap:8px;margin:0;font-size:16px;color:#e2e8f0}
+.lgroup h2 small{font-size:12px;color:#64748b;font-weight:600}
+.lgroup>p{margin:2px 0 10px 26px;color:#94a3b8;font-size:13px}

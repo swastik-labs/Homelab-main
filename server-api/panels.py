@@ -654,13 +654,7 @@ def tile(section, title, ic, value, unit="", lv=None, gauge=None, meaning="", ex
 
 
 
-LINKS = [("MC Panel", "Minecraft server panel", "http://192.168.31.125:8081", "minecraft", "#4ade80"),
-         ("Beszel", "System monitoring", "http://192.168.31.125:8090", "chart-areaspline", "#2dd4bf"),
-         ("Immich", "Photos", "http://192.168.31.125:2283", "image-multiple", "#f472b6"),
-         ("GitHub", "swastik-labs", "https://github.com/swastik-labs", "github", "#e2e8f0")]
-
-
-def panel_home(sysd, bat, hist, e, rows, live, t, d, imm, g, attention):
+def panel_home(sysd, bat, hist, e, rows, live, t, d, imm, g, attention, ld=None):
     s = sysd if ok_dict(sysd) else {}
     today = date.today().isoformat()
     ydays = [r for r in (rows or []) if r["date"] < today]
@@ -744,9 +738,9 @@ def panel_home(sysd, bat, hist, e, rows, live, t, d, imm, g, attention):
                   lv_r, None, f"Last deploy {ago(g.get('last_run_at')) or '—'}",
                   extra=f'<div class="tx">{mark} {esc(g.get("last_run_repo") or "no deploys yet")}</div>')
 
-    links = '<div class="links">' + "".join(
-        f'<a class="lnk" href="{u}" target="_blank" rel="noopener"><span class="li" style="background:color-mix(in srgb,{c} 18%,transparent)">'
-        f'{icon(ic, c, 22)}</span><span><b>{n}</b><span>{d_}</span></span></a>' for n, d_, u, ic, c in LINKS) + "</div>"
+    quick = [l for l in (ld or {}).get("links", []) if l["group"] != "External"]
+    links = ('<div class="links">' + "".join(app_link(l) for l in quick) + "</div>" if quick else
+             '<p class="empty">No apps with a web page found yet. Any container that publishes a port shows up here.</p>')
 
     body = (banner + '<div class="sec">Server vitals</div><div class="g6">' + "".join(vit) + "</div>"
             + '<div class="sec">Services</div><div class="g5">' + power + traffic + cont + immich + runner + "</div>"
@@ -754,16 +748,74 @@ def panel_home(sysd, bat, hist, e, rows, live, t, d, imm, g, attention):
     return page("home", body)
 
 
-# ------------------------------------------------------------------ Links
-ALL_LINKS = LINKS + [
-    ("playit.gg", "Tunnel for Minecraft friends", "https://playit.gg", "tunnel", "#34d399"),
-    ("Discord", "Bot servers", "https://discord.com/app", "message-text", "#818cf8"),
-]
+# ------------------------------------------------------------------ Links (auto-discovered)
+GROUP_INFO = {
+    "Apps": ("apps", "Web apps running on the server."),
+    "Minecraft": ("minecraft", "MC Panel and every Minecraft world. Worlds have no web page; start and stop them in MC Panel."),
+    "Monitoring": ("chart-areaspline", "Tools that watch the server."),
+    "Projects": ("folder-wrench-outline", "Your own apps. Anything new with a published port appears here automatically."),
+    "External": ("web", "Useful sites outside the server."),
+}
+STATE_LEVEL = {"running": "ok", "restarting": "warn", "paused": "warn"}
 
 
-def panel_links():
-    items = "".join(
-        f'<a class="lnk big" href="{u}" target="_blank" rel="noopener"><span class="li" style="background:color-mix(in srgb,{c} 18%,transparent)">'
-        f'{icon(ic, c, 26)}</span><span><b>{n}</b><span>{d_}</span><span class="url">{esc(u.replace("https://", "").replace("http://", ""))}</span></span></a>'
-        for n, d_, u, ic, c in ALL_LINKS)
-    return page("links", f'<div class="links l3">{items}</div>')
+def state_dot(state):
+    lv = STATE_LEVEL.get(state, "bad")
+    word = {"ok": "Running", "warn": state.capitalize()}.get(lv, "Stopped")
+    return f'<span class="sdot" style="--c:{LEVEL_COLOUR[lv]}" title="{word}"></span>'
+
+
+def app_link(l, big=False):
+    """A discovered app. The browser fills in href from its own hostname + port (web/app.js)."""
+    c = l["color"]
+    new = '<span class="newb">NEW</span>' if l.get("new") else ""
+    stopped = "" if l["state"] == "running" else '<span class="stopped">Stopped</span>'
+    url = (f'<span class="url"><span data-hostport>…</span>{esc(l["path"]) if l["path"] != "/" else ""}</span>' if big else "")
+    return (f'<a class="lnk applink{" big" if big else ""}" href="#links" target="_blank" rel="noopener" '
+            f'data-port="{int(l["port"])}" data-path="{esc(l["path"])}" data-scheme="{esc(l["scheme"])}">'
+            f'<span class="li" style="background:color-mix(in srgb,{c} 18%,transparent)">{icon(l["icon"], c, 26 if big else 22)}</span>'
+            f'<span class="lt"><b>{esc(l["name"])}{new}</b><span>{esc(l["description"])}</span>{url}</span>'
+            f'{stopped}{state_dot(l["state"])}</a>')
+
+
+def ext_link(name, desc, url, ic, c):
+    return (f'<a class="lnk big" href="{esc(url)}" target="_blank" rel="noopener">'
+            f'<span class="li" style="background:color-mix(in srgb,{c} 18%,transparent)">{icon(ic, c, 26)}</span>'
+            f'<span class="lt"><b>{esc(name)}</b><span>{esc(desc)}</span>'
+            f'<span class="url">{esc(url.split("://", 1)[-1])}</span></span></a>')
+
+
+def world_tile(w):
+    up = w["state"] == "running"
+    lv = "ok" if up else (None if w["managed"] else "bad")  # stopped MC Panel worlds are normal
+    note = ("Running" if up else "Stopped") + (" · managed by MC Panel" if w["managed"] else " · standalone server")
+    return (f'<div class="lnk big world"><span class="li" style="background:color-mix(in srgb,#4ade80 14%,transparent)">'
+            f'{icon("minecraft", "#4ade80" if up else MUTED, 26)}</span>'
+            f'<span class="lt"><b>{esc(w["name"])}</b><span>{note}</span><span class="url">{esc(w.get("status") or "")}</span></span>'
+            f'<span class="sdot" style="--c:{LEVEL_COLOUR[lv]}"></span></div>')
+
+
+def panel_links(ld):
+    from links import EXTERNAL, GROUP_ORDER
+    ld = ld if isinstance(ld, dict) else {}
+    groups = {}
+    for l in ld.get("links", []):
+        groups.setdefault(l["group"], []).append(app_link(l, big=True))
+    for w in ld.get("worlds", []):
+        groups.setdefault("Minecraft", []).append(world_tile(w))
+    groups["External"] = [ext_link(*x) for x in EXTERNAL]
+    names = [g for g in GROUP_ORDER if g in groups] + sorted(g for g in groups if g not in GROUP_ORDER)
+    out = []
+    if "error" in ld:
+        out.append(f'<p class="empty">Couldn\'t read Docker to find apps ({esc(str(ld["error"]))}).</p>')
+    for g in names:
+        ic, desc = GROUP_INFO.get(g, ("folder-outline", "Grouped with the homelab.group label."))
+        out.append(f'<div class="lgroup"><h2>{icon(ic, "#94a3b8", 18)}{esc(g)} <small>{len(groups[g])}</small></h2>'
+                   f'<p>{desc}</p><div class="links l3">{"".join(groups[g])}</div></div>')
+    n = len(ld.get("links", []))
+    out.append(f'<p class="ex" style="margin-top:18px">Found {n} app{"s" if n != 1 else ""} automatically from Docker: '
+               'every container that publishes a port gets a link, except databases and this dashboard. '
+               'Green = running, red = stopped, NEW = first seen in the last 24 h. '
+               'Customise one with Docker labels like <code>homelab.name</code>, <code>homelab.icon</code>, '
+               '<code>homelab.group</code> or hide it with <code>homelab.hide=true</code>.</p>')
+    return page("links", "".join(out))

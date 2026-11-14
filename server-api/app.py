@@ -15,6 +15,7 @@ from collections import deque
 from datetime import date, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+import links
 import panels
 
 MOCK = os.environ.get("MOCK") == "1"
@@ -800,10 +801,63 @@ def tab_for(what):
 
 
 
+# ---------------------------------------------------------------- auto-discovered links (Links tab, Home buttons)
+FIRST_SEEN = {}          # container name -> first time seen; 0 = already there when the dashboard started
+_links_baseline = [False]
+
+
+def mock_containers():
+    """Docker /containers/json-shaped mock data, plus PortBindings for the stopped ones."""
+    def c(name, image, state, ports=(), labels=None, status=None):
+        return {"Id": (name.replace("_", "").replace("-", "") + "0" * 12)[:12] + "mock", "Names": ["/" + name],
+                "Image": image, "State": state, "Labels": labels or {},
+                "Status": status or ("Up 12 days" if state == "running" else "Exited (0) 2 days ago"),
+                "Ports": [{"IP": ip, "PrivatePort": cp, "PublicPort": hp, "Type": "tcp"}
+                          for hp, cp in ports for ip in ("0.0.0.0", "::")] if state == "running" else [],
+                "_bindings": {f"{cp}/tcp": [{"HostIp": "", "HostPort": str(hp)}] for hp, cp in ports}}
+    world = {"mcpanel": "1"}
+    return [
+        c("immich_server", "ghcr.io/immich-app/immich-server:v2.3.1", "running", [(2283, 2283)]),
+        c("immich_postgres", "ghcr.io/immich-app/postgres:14-vectorchord0.4.3", "running", [(5432, 5432)]),
+        c("immich_redis", "docker.io/valkey/valkey:8-bookworm", "running"),
+        c("beszel", "henrygd/beszel:latest", "running", [(8090, 8090)]),
+        c("beszel-agent", "henrygd/beszel-agent:latest", "running"),
+        c("mcpanel", "mcpanel-mcpanel:latest", "running", [(8081, 8000)]),
+        c("bunkers", "bunkers-web:latest", "running", [(3001, 3000)]),
+        c("dozzle", "amir20/dozzle:latest", "exited", [(8888, 8080)]),
+        c("homelab-dashboard", "homelab-dashboard:latest", "running", [(3000, 3000)]),
+        c("pvt-discord-bot", "pvt-discord-bot:latest", "running"),
+        c("mc-discord-bot", "mc-discord-bot:latest", "running"),
+        c("mc-2", "itzg/minecraft-server:latest", "running", [(25566, 25565)], world, "Up 3 hours"),
+        c("mc-1", "itzg/minecraft-server:latest", "exited", [(25565, 25565)], world),
+        c("mc-server", "itzg/minecraft-server:latest", "exited", [], None, "Exited (143) 5 days ago"),
+        c("extraction-service", "extraction-service:latest", "exited"),
+    ]
+
+
+@cached(30)
+def links_data():
+    if MOCK:
+        containers = mock_containers()
+        by_id = {c["Id"]: c for c in containers}
+        inspect = lambda cid: {"HostConfig": {"PortBindings": by_id[cid]["_bindings"]}}
+    else:
+        containers = docker_get("/containers/json?all=1")
+        inspect = lambda cid: docker_get(f"/containers/{cid}/json")
+    if not _links_baseline[0]:  # whatever exists when the dashboard starts is not "new"
+        for c in containers:
+            FIRST_SEEN.setdefault(((c.get("Names") or ["?"])[0]).lstrip("/"), 0)
+        _links_baseline[0] = True
+        if MOCK:
+            FIRST_SEEN["bunkers"] = time.time() - 2 * 3600  # show off the NEW badge
+    return links.discover(containers, inspect, os.environ.get("HOSTNAME", ""), FIRST_SEEN)
+
+
 ROUTES = {
     "/health/system": health_system, "/health/battery": health_battery, "/health/ssd": health_ssd,
     "/health/updates": health_updates, "/energy": energy, "/traffic": traffic, "/docker": docker,
     "/immich": immich, "/github": github, "/security": security, "/tracker": tracker,
+    "/links": links_data,
 }
 
 
@@ -882,8 +936,8 @@ PANEL_RENDERERS = {
     "docker": lambda: panels.panel_docker(docker()),
     "security": lambda: panels.panel_security(security()),
     "home": lambda: panels.panel_home(health_system(), health_battery(), history(), energy(), *_rows_with_live(),
-                                      traffic(), docker(), immich(), github(), attention_items()),
-    "links": lambda: panels.panel_links(),
+                                      traffic(), docker(), immich(), github(), attention_items(), links_data()),
+    "links": lambda: panels.panel_links(links_data()),
 }
 
 
