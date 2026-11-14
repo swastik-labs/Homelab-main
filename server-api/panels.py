@@ -160,11 +160,15 @@ def nice_max(v):
     return 10 * e
 
 
+COLLECTING = "Collecting data, the first full day appears tomorrow"
+NO_LIVE = "No live reading yet"
+
+
 def bar_chart(labels, series, fmt, value_labels=None, avg=None, height=170, stacked=True, legend=None):
     """series: list of (name, colour, values). Stacked bars, y grid, x labels, optional average line."""
     n = len(labels)
     if n == 0:
-        return '<p class="empty">No data yet. Charts fill in as days are recorded.</p>'
+        return f'<p class="empty chart-empty">{COLLECTING}.</p>'
     W, H, L, B, T = 640, height, 46, 22, 14
     totals = [sum((s[2][i] or 0) for s in series) for i in range(n)] if stacked else \
         [max((s[2][i] or 0) for s in series) for i in range(n)]
@@ -379,30 +383,36 @@ def panel_power(e, rows, live, rate, base_watts=9):
     live_note = (f"Last reading {ago(live.get('updated_at'))}." if live and live.get("updated_at")
                  else "Apply the energy-tracker patch (see the README) to see today's live numbers.")
     cards.append(card("Today so far", "flash", big(f"{tk:.2f}" if tk is not None else "—", "kWh", None, sub)
-                      + (trend(pace, yk, "yesterday") if pace else "")
+                      + (trend(pace, yk, "yesterday") if pace and yk else "")
                       + (f'<div class="sub" style="margin-top:6px;font-size:12.5px">On pace for about {pace:.2f} kWh today</div>' if pace else "")
                       + spark([r["total_kwh"] for r in ydays[-14:]] + ([pace] if pace else [])),
                       "none", f"Electricity the server used today, estimated at ₹{rate:g}/kWh. {live_note}"))
-    cards.append(card("Yesterday", "calendar-arrow-left", big(f"{yk:.2f}" if yk is not None else "—", "kWh", None,
-                                                              f"₹{e['yesterday_cost_inr']:.2f}" if e.get("yesterday_cost_inr") is not None else "")
+    cards.append(card("Yesterday", "calendar-arrow-left", big(f"{yk:.2f}" if yk is not None else "—", "kWh" if yk is not None else "", None,
+                                                              f"₹{e['yesterday_cost_inr']:.2f}" if e.get("yesterday_cost_inr") is not None else COLLECTING)
                       + (trend(yk, ydays[-2]["total_kwh"] if len(ydays) >= 2 else None, "the day before") if yk is not None else ""),
                       "none", "A full day of use, from the energy tracker's daily report."))
     proj, pk = e.get("projected_bill_inr"), e.get("projected_kwh")
     prev_kwh = sum(r["total_kwh"] or 0 for r in prev_m) or None
+    prev_full = len(prev_m) >= calendar.monthrange(pm_end.year, pm_end.month)[1] - 2  # compare with a whole month only
     dim = calendar.monthrange(today.year, today.month)[1]
     mk = e.get("month_kwh")
     cards.append(card("Expected bill this month", "cash", big(f"₹{proj:.0f}" if proj is not None else "—", "", None,
-                                                              f"about {pk:.1f} kWh in {today:%B}" if pk else "Not enough data yet")
-                      + (trend(pk, prev_kwh, pm_end.strftime("%B")) if pk else "")
-                      + bar((mk or 0) / pk * 100 if pk else 0, "ok", f"₹{e.get('month_cost_inr') or 0:.0f} used so far", f"day {today.day} of {dim}"),
+                                                              f"about {pk:.1f} kWh in {today:%B}" if pk else COLLECTING)
+                      + (trend(pk, prev_kwh, pm_end.strftime("%B")) if pk and prev_full else "")
+                      + (bar((mk or 0) / pk * 100, "ok", f"₹{e.get('month_cost_inr') or 0:.0f} used so far", f"day {today.day} of {dim}") if pk else ""),
                       "none", f"Guess for the full month, based on use so far at ₹{rate:g}/kWh."))
     avg_kwh = (sum(r["total_kwh"] or 0 for r in this_m) / len(this_m)) if this_m else (yk or None)
     watts = avg_kwh * 1000 / 24 if avg_kwh else None
+    from_today = not watts and tk and hours > 0.5
+    if from_today:  # no full day yet: use today's rate so far
+        watts, avg_kwh = tk * 1000 / hours, tk / hours * 24
     cards.append(card("Average power draw", "lightbulb-on-outline",
                       big(f"{watts:.0f}" if watts else "—", "watts", None,
                           f"{watts / 9:.1f}× a 9 W LED bulb, all day" if watts else "")
                       + (f'<div class="sub" style="margin-top:6px;font-size:12.5px">≈ ₹{avg_kwh * rate * 30:.0f} per month · ₹{avg_kwh * rate * 365:.0f} per year</div>' if avg_kwh else ""),
-                      "none", f"Average over this month's full days. Includes a fixed {base_watts} W for the rest of the laptop."))
+                      "none", ("Based on today so far; becomes a daily average after the first full day. " if from_today
+                               else "Average over this month's full days. " if watts else COLLECTING + ". ")
+                      + f"Includes a fixed {base_watts} W for the rest of the laptop."))
     last7 = ydays[-7:]
     cards.append(card("Last 7 days", "chart-bar",
                       bar_chart([_day_label(r["date"]) for r in last7], [("kWh", "#f59e0b", [r["total_kwh"] for r in last7])],
@@ -413,44 +423,28 @@ def panel_power(e, rows, live, rate, base_watts=9):
     cards.append(card("Last 30 days", "chart-bar",
                       bar_chart([datetime.fromisoformat(r["date"]).strftime("%d %b") for r in last30],
                                 [("kWh", "#f59e0b", [r["total_kwh"] for r in last30])], lambda v: f"{v:.2f}", avg=a30),
-                      "none", f"Daily use over the last month. Total ₹{sum(r['cost_inr'] or 0 for r in last30):.0f} for these {len(last30)} days.", span=2))
+                      "none", (f"Daily use over the last month. Total ₹{sum(r['cost_inr'] or 0 for r in last30):.0f} for these "
+                               f"{len(last30)} day{'s' if len(last30) != 1 else ''}." if last30 else
+                               "The chart fills in one bar per day as the tracker records them."), span=2))
     return page("power", f'<div class="grid">{"".join(cards)}</div>')
 
 
-# ------------------------------------------------------------------ Traffic
-def nice_day(d):
-    return f"{d.day} {d:%b}"
-
-
-def is_internet(day_iso, since):
-    """Daily rows after the switch day are internet-only; the switch day itself was mixed."""
-    return day_iso > since.isoformat()
-
-
-def internet_days(rows, since):
-    return [r for r in rows if is_internet(r["date"], since)]
-
-
+# ------------------------------------------------------------------ Internet usage
 def day_total(r):
     return (r["rx_bytes"] or 0) + (r["tx_bytes"] or 0)
 
 
-def panel_traffic(t, rows, live, since):
+def panel_traffic(t, rows, live):
     t = t if ok_dict(t) else {}
     rows = rows or []
     today = date.today()
     ydays = [r for r in rows if r["date"] < today.isoformat()]
     this_m, prev_m, pm_end = month_split(rows, today)
     hours = (live or {}).get("hours") or 0
-    live_inet = (live or {}).get("traffic_scope") == "internet"
     tot = t.get("today_total")
     pace = tot / hours * 24 if tot and hours > 1 else None
-    yrow = next((r for r in ydays if r["date"] == (today - timedelta(days=1)).isoformat()), None)
-    y_inet = bool(yrow) and is_internet(yrow["date"], since)
     ytot = t.get("yesterday_total")
-    D, U, GD, GU = "#38bdf8", "#818cf8", "#475569", "#64748b"
-    first_full = since + timedelta(days=1)
-    lan_note = f"includes home network (internet-only from {nice_day(first_full)})"
+    D, U = "#38bdf8", "#818cf8"
 
     def split_bar(rx, tx):
         if rx is None:
@@ -461,53 +455,30 @@ def panel_traffic(t, rows, live, since):
                 f'<div class="bar" style="display:flex"><i style="width:{rx / s_ * 100:.1f}%;background:{D};border-radius:0"></i>'
                 f'<i style="width:{tx / s_ * 100:.1f}%;background:{U};border-radius:0"></i></div></div>')
 
-    def scope_tag(text):
-        return f'<span class="trend" style="--c:{MUTED}">{esc(text)}</span>'
-
-    inet_hist = [day_total(r) for r in internet_days(ydays, since)][-14:]
     cards = [
-        card("Today so far", "earth", big(gb(tot) if tot is not None else "—", "", None)
+        card("Today so far", "earth",
+             big(gb(tot) if tot is not None else "—", "", None, None if tot is not None else NO_LIVE)
              + split_bar(t.get("today_rx"), t.get("today_tx"))
-             + (trend(pace, ytot, "yesterday", neutral=True) if pace and live_inet and y_inet else "")
-             + ("" if live_inet or tot is None else scope_tag("includes home network (tracker not switched yet)"))
-             + spark(inet_hist + ([pace] if pace and live_inet else [])),
-             "none", "Data to and from the internet today." if live_inet or tot is None
-             else "The energy tracker hasn't switched to internet-only counting, so this still includes home transfers."),
-        card("Yesterday", "calendar-arrow-left", big(gb(ytot) if ytot is not None else "—", "", None)
-             + split_bar(t.get("yesterday_rx"), t.get("yesterday_tx"))
-             + ("" if y_inet or ytot is None else scope_tag(lan_note)),
+             + (trend(pace, ytot, "yesterday", neutral=True) if pace and ytot else "")
+             + spark([day_total(r) for r in ydays[-14:]] + ([pace] if pace else [])),
+             "none", "Data to and from the internet today."),
+        card("Yesterday", "calendar-arrow-left",
+             big(gb(ytot) if ytot is not None else "—", "", None, None if ytot is not None else COLLECTING)
+             + split_bar(t.get("yesterday_rx"), t.get("yesterday_tx")),
              "none", "A full day, from the energy tracker's daily report."),
     ]
-    # ---- this month: only internet-only days (+ today) count towards the headline and pace
-    m_inet = internet_days(this_m, since)
-    m_lan = [r for r in this_m if not is_internet(r["date"], since)]
-    m_tot = sum(day_total(r) for r in m_inet) + (tot or 0 if live_inet else 0)
-    m_rx = sum(r["rx_bytes"] or 0 for r in m_inet) + ((t.get("today_rx") or 0) if live_inet else 0)
-    m_tx = sum(r["tx_bytes"] or 0 for r in m_inet) + ((t.get("today_tx") or 0) if live_inet else 0)
-    days_done = len(m_inet) + (hours / 24 if live_inet else 0)
+    m_tot = t.get("month_total")
     dim = calendar.monthrange(today.year, today.month)[1]
-    mpace = m_tot / days_done * dim if m_tot and days_done >= 1 else None
-    prev_inet = bool(prev_m) and all(is_internet(r["date"], since) for r in prev_m)
-    prev_tot = sum(day_total(r) for r in prev_m) if prev_inet else None
-    if not m_lan:
-        since_txt = "since the 1st"
-    elif m_inet:
-        since_txt = f"since {nice_day(max(first_full, today.replace(day=1)))}"
-    else:
-        since_txt = "today so far"  # the switch was today or yesterday: no full internet-only day yet
-    lan_rows = ""
-    if m_lan:
-        last_lan = max(int(r["date"][8:]) for r in m_lan)
-        lan_label = f"1–{last_lan} {today:%b} (incl. home network)"
-        lan_rows = f'<div class="rows" style="margin-top:8px">{row(lan_label, gb(sum(day_total(r) for r in m_lan)))}</div>'
+    full_m = len(this_m)
+    mpace = (sum(day_total(r) for r in this_m) / full_m * dim) if full_m else None
+    prev_dim = calendar.monthrange(pm_end.year, pm_end.month)[1]
+    prev_tot = sum(day_total(r) for r in prev_m) if len(prev_m) >= prev_dim - 2 else None  # only a (nearly) complete month
     cards.append(card(f"This month ({today:%B})", "calendar-month",
-                      big(gb(m_tot) if days_done else "—", since_txt, None,
-                          f"on pace for about {gb(mpace)} for the month" if mpace else "Pace shows after the first full day")
-                      + split_bar(m_rx, m_tx)
-                      + (trend(mpace, prev_tot, pm_end.strftime("%B"), neutral=True) if mpace and prev_tot else "")
-                      + lan_rows,
-                      "none", "Internet data this month. Older days that also counted home transfers are listed separately."
-                      if m_lan else "Internet data since the 1st."))
+                      big(gb(m_tot) if m_tot else "—", "so far" if m_tot else "", None,
+                          f"on pace for about {gb(mpace)} for the month" if mpace else COLLECTING)
+                      + (split_bar(t.get("month_rx"), t.get("month_tx")) if m_tot else "")
+                      + (trend(mpace, prev_tot, pm_end.strftime("%B"), neutral=True) if mpace and prev_tot else ""),
+                      "none", "Running total since the 1st (or since tracking started)."))
     cards.append(card("What counts?", "information-outline",
                       '<div class="rows">'
                       + row("Counted", "Discord bots, Minecraft players via playit, updates, Docker pulls, GitHub deploys", "ok")
@@ -515,38 +486,26 @@ def panel_traffic(t, rows, live, since):
                       + "</div>",
                       "none", "Only traffic that leaves your home network, the part your ISP counts. "
                       "Docker-internal and Tailscale traffic is left out too."))
-    legend = [("Downloaded", D), ("Uploaded", U), (f"Up to {nice_day(since)}: includes home network", GD)]
-
-    def series(days):
-        inet = [is_internet(r["date"], since) for r in days]
-        return [("Downloaded", D, [(r["rx_bytes"] or 0) / 1e9 if i else 0 for r, i in zip(days, inet)]),
-                ("Uploaded", U, [(r["tx_bytes"] or 0) / 1e9 if i else 0 for r, i in zip(days, inet)]),
-                ("Downloaded (incl. home)", GD, [0 if i else (r["rx_bytes"] or 0) / 1e9 for r, i in zip(days, inet)]),
-                ("Uploaded (incl. home)", GU, [0 if i else (r["tx_bytes"] or 0) / 1e9 for r, i in zip(days, inet)])]
-
+    legend = [("Downloaded", D), ("Uploaded", U)]
     last7 = ydays[-7:]
-    any_lan7 = any(not is_internet(r["date"], since) for r in last7)
     cards.append(card("Last 7 days", "chart-bar",
-                      bar_chart([_day_label(r["date"]) for r in last7], series(last7),
+                      bar_chart([_day_label(r["date"]) for r in last7],
+                                [("Downloaded", D, [(r["rx_bytes"] or 0) / 1e9 for r in last7]),
+                                 ("Uploaded", U, [(r["tx_bytes"] or 0) / 1e9 for r in last7])],
                                 lambda v: f"{v:.1f} GB" if v < 10 else f"{v:.0f} GB",
-                                value_labels=[gb(day_total(r)) for r in last7],
-                                legend=legend if any_lan7 else legend[:2]),
-                      "none", "Internet data per day, split into downloaded and uploaded."
-                      + (f" Grey bars are from before the switch on {nice_day(since)} and also include home transfers." if any_lan7 else ""),
-                      span=2))
+                                value_labels=[gb(day_total(r)) for r in last7], legend=legend),
+                      "none", "Internet data per day, split into downloaded and uploaded.", span=2))
     last30 = ydays[-30:]
-    inet30 = [day_total(r) / 1e9 for r in internet_days(last30, since)]
-    any_lan30 = len(inet30) < len(last30)
+    tots = [day_total(r) / 1e9 for r in last30]
     cards.append(card("Last 30 days", "chart-bar",
-                      bar_chart([datetime.fromisoformat(r["date"]).strftime("%d %b") for r in last30], series(last30),
+                      bar_chart([datetime.fromisoformat(r["date"]).strftime("%d %b") for r in last30],
+                                [("Downloaded", D, [(r["rx_bytes"] or 0) / 1e9 for r in last30]),
+                                 ("Uploaded", U, [(r["tx_bytes"] or 0) / 1e9 for r in last30])],
                                 lambda v: f"{v:.0f} GB" if v >= 1 else f"{v:.1f} GB",
-                                avg=sum(inet30) / len(inet30) if len(inet30) >= 3 else None,
-                                legend=legend if any_lan30 else legend[:2]),
-                      "none", ((f"Internet-only since {nice_day(since)}: {gb(sum(inet30) * 1e9)} over {len(inet30)} full "
-                                f"day{'s' if len(inet30) != 1 else ''}, about {gb(sum(inet30) / len(inet30) * 1e9)} a day."
-                                if inet30 else
-                                f"Internet-only counting started on {nice_day(since)}; full days show here in colour from {nice_day(first_full)}.")
-                               + (" Grey bars also include home transfers." if any_lan30 else "")),
+                                avg=sum(tots) / len(tots) if len(tots) >= 3 else None, legend=legend),
+                      "none", (f"{gb(sum(tots) * 1e9)} over {len(tots)} day{'s' if len(tots) != 1 else ''}, "
+                               f"about {gb(sum(tots) / len(tots) * 1e9)} a day." if tots else
+                               "The chart fills in one bar per day as the tracker records them."),
                       span=2))
     return page("traffic", f'<div class="grid">{"".join(cards)}</div>')
 
@@ -723,7 +682,7 @@ def tile(section, title, ic, value, unit="", lv=None, gauge=None, meaning="", ex
 
 
 
-def panel_home(sysd, bat, hist, e, rows, live, t, d, imm, g, attention, ld=None, since=None):
+def panel_home(sysd, bat, hist, e, rows, live, t, d, imm, g, attention, ld=None):
     s = sysd if ok_dict(sysd) else {}
     today = date.today().isoformat()
     ydays = [r for r in (rows or []) if r["date"] < today]
@@ -776,19 +735,17 @@ def panel_home(sysd, bat, hist, e, rows, live, t, d, imm, g, attention, ld=None,
     tt = t if ok_dict(t) else {}
     tot = tt.get("today_total")
     tpace = tot / hours * 24 if tot and hours > 1 else None
-    live_inet = (live or {}).get("traffic_scope") == "internet"
-    since = since or date.today()
-    y_inet = bool(ydays) and ydays[-1]["date"] == (date.today() - timedelta(days=1)).isoformat() and is_internet(ydays[-1]["date"], since)
     power = tile("power", "Power today", "flash", f"{tk:.2f}" if tk is not None else "—", "kWh", None, None,
-                 (f"₹{e.get('today_cost_inr') or 0:.2f} so far · bill ≈ ₹{e.get('projected_bill_inr') or 0:.0f}/month"
+                 (f"₹{e.get('today_cost_inr') or 0:.2f} so far" + (f" · bill ≈ ₹{e['projected_bill_inr']:.0f}/month"
+                                                                   if e.get("projected_bill_inr") else " · bill estimate from tomorrow")
                   if tk is not None else "No live reading: apply the energy-tracker patch"),
-                 extra=trend(pace, yk, "yesterday") if pace else "",
+                 extra=trend(pace, yk, "yesterday") if pace and yk else "",
                  sparkline=spark([r["total_kwh"] for r in ydays[-14:]] + ([pace] if pace else [])))
     traffic = tile("traffic", "Internet today", "earth", gb(tot) if tot is not None else "—", "", None, None,
                    f"↓ {gb(tt.get('today_rx'))} down · ↑ {gb(tt.get('today_tx'))} up"
-                   + ("" if live_inet or tot is None else " · incl. home network"),
-                   extra=trend(tpace, tt.get("yesterday_total"), "yesterday", neutral=True) if tpace and live_inet and y_inet else "",
-                   sparkline=spark([day_total(r) for r in internet_days(ydays, since)][-14:]))
+                   if tot is not None else NO_LIVE,
+                   extra=trend(tpace, tt.get("yesterday_total"), "yesterday", neutral=True) if tpace and tt.get("yesterday_total") else "",
+                   sparkline=spark([day_total(r) for r in ydays[-14:]]))
     if ok_dict(d):
         down, expected = d.get("down") or [], d.get("expected") or d["total"]
         lv_c = "bad" if down else "ok"

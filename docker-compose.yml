@@ -18,7 +18,6 @@ services:
       TZ: Asia/Kolkata
       MOCK: "0"
       IGNORE_STOPPED_CONTAINERS: extraction-service   # stopped on purpose, don't raise an alert
-      INTERNET_ONLY_SINCE: "2026-11-14"   # energy tracker counts internet-only traffic from this day (mid-day switch)
       IMMICH_URL: http://192.168.31.125:2283
       IMMICH_API_KEY: ${IMMICH_API_KEY:-}
       DASH_GITHUB_TOKEN: ${DASH_GITHUB_TOKEN:-}

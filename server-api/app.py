@@ -26,10 +26,6 @@ ENERGY_DIR = os.environ.get("ENERGY_DIR", HOSTFS + "/home/swastik/energy-tracker
 DB_PATH = ENERGY_DIR + "/energy_tracker.db"
 LIVE_PATH = ENERGY_DIR + "/live.json"
 RATE_INR = float(os.environ.get("RATE_INR_PER_KWH", "5"))
-# The energy tracker counts internet-only traffic since this day (switched mid-day), so daily
-# rows up to and including it also contain home-network transfers. Mock mode puts it 6 days back.
-INTERNET_ONLY_SINCE = date.fromisoformat(os.environ.get("INTERNET_ONLY_SINCE")
-                                         or ((date.today() - timedelta(days=6)).isoformat() if MOCK else "2026-11-14"))
 DOCKER_SOCK = "/var/run/docker.sock"
 IMMICH_URL = os.environ.get("IMMICH_URL", "http://192.168.31.125:2283").rstrip("/")
 IMMICH_KEY = os.environ.get("IMMICH_API_KEY", "")
@@ -333,9 +329,7 @@ def db_rows(since):
         rnd = random.Random(42)
         while d < today:
             cpu = round(rnd.uniform(0.04, 0.09), 3)
-            internet = d > INTERNET_ONLY_SINCE  # before: home network included, so much bigger
-            rx = rnd.uniform(0.4e9, 1.6e9) if internet else rnd.uniform(1.5e9, 9e9)
-            tx = rnd.uniform(0.15e9, 0.6e9) if internet else rnd.uniform(0.4e9, 3e9)
+            rx, tx = rnd.uniform(0.4e9, 1.6e9), rnd.uniform(0.15e9, 0.6e9)  # internet-only
             rows.append({"date": d.isoformat(), "cpu_kwh": cpu, "total_kwh": round(cpu + 0.216, 3),
                          "cost_inr": round((cpu + 0.216) * RATE_INR, 2),
                          "rx_bytes": int(rx), "tx_bytes": int(tx), "hours": 24})
@@ -407,9 +401,16 @@ def energy():
         return res
     m_kwh = sum(_f(r["total_kwh"]) for r in month_rows) + (lv["total_kwh_so_far"] if lv else 0)
     m_cost = sum(_f(r["cost_inr"]) for r in month_rows) + (res["today_cost_inr"] or 0)
-    elapsed_days = len(month_rows) + ((lv.get("hours") or 0) / 24 if lv else 0)
     dim = calendar.monthrange(today.year, today.month)[1]
-    proj_kwh = m_kwh / elapsed_days * dim if elapsed_days > 0.1 else None
+    full = [r for r in rows or [] if r["date"] < today.isoformat()]
+    if month_rows:   # month so far + average of this month's full days for the rest
+        avg = sum(_f(r["total_kwh"]) for r in month_rows) / len(month_rows)
+        proj_kwh = sum(_f(r["total_kwh"]) for r in month_rows) + avg * (dim - len(month_rows))
+    elif full:       # 1st of the month: use the latest full days
+        last = full[-7:]
+        proj_kwh = sum(_f(r["total_kwh"]) for r in last) / len(last) * dim
+    else:            # no full day recorded yet
+        proj_kwh = None
     res.update(month_kwh=round(m_kwh, 2), month_cost_inr=round(m_cost, 2),
                projected_kwh=round(proj_kwh, 1) if proj_kwh else None,
                projected_bill_inr=round(proj_kwh * RATE_INR, 0) if proj_kwh else None)
@@ -937,13 +938,13 @@ def _rows_with_live():
 PANEL_RENDERERS = {
     "health": lambda: panels.panel_health(health_system(), health_battery(), health_ssd(), health_updates(), history()),
     "power": lambda: panels.panel_power(energy(), *_rows_with_live(), RATE_INR),
-    "traffic": lambda: panels.panel_traffic(traffic(), *_rows_with_live(), INTERNET_ONLY_SINCE),
+    "traffic": lambda: panels.panel_traffic(traffic(), *_rows_with_live()),
     "immich": lambda: panels.panel_immich(immich()),
     "bots": lambda: panels.panel_bots(docker(), tracker(), github()),
     "docker": lambda: panels.panel_docker(docker()),
     "security": lambda: panels.panel_security(security()),
     "home": lambda: panels.panel_home(health_system(), health_battery(), history(), energy(), *_rows_with_live(),
-                                      traffic(), docker(), immich(), github(), attention_items(), links_data(), INTERNET_ONLY_SINCE),
+                                      traffic(), docker(), immich(), github(), attention_items(), links_data()),
     "links": lambda: panels.panel_links(links_data()),
 }
 
