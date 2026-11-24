@@ -1,5 +1,6 @@
 // swastikserver dashboard: hash-routed tabs; each tab is an HTML fragment from /panel/<id>,
 // re-fetched every few seconds and swapped in place (no page reloads, no framework).
+// Extra routes: #incidents?status=open&range=7d, #incident-<id>, #logs-<container>.
 (() => {
   const MDI = (n) => `https://cdn.jsdelivr.net/npm/@mdi/svg@7.4.47/svg/${n}.svg`;
   const TABS = [
@@ -19,6 +20,8 @@
       sub: "Every app container on the server and the disk space Docker uses." },
     { id: "security", name: "Security", icon: "shield-check", accent: "#34d399", every: 30,
       sub: "Login attempts, firewall and the playit tunnel." },
+    { id: "incidents", name: "Incidents", icon: "alert-octagon-outline", accent: "#f87171", every: 20,
+      sub: "What broke, when, and why: the logs and details saved at that moment. Kept for 30 days." },
     { id: "links", name: "Links", icon: "link-variant", accent: "#94a3b8", every: 0,
       sub: "The other apps running on the server." },
   ];
@@ -27,7 +30,7 @@
   const view = document.getElementById("view");
   const head = document.getElementById("sechead");
   const stamp = document.getElementById("stamp");
-  let current = null, timer = null, lastOk = 0, seq = 0;
+  let current = null, route = null, timer = null, lastOk = 0, seq = 0;
 
   nav.innerHTML = TABS.map((t) =>
     `<a href="#${t.id}" data-id="${t.id}" style="--accent:${t.accent}">` +
@@ -48,14 +51,30 @@
     });
   }
 
+  // "#incident-12" -> incidents tab, /panel/incident/12 ; "#incidents?status=open" -> /panel/incidents?status=open
+  function resolve(hash) {
+    const [id, qs] = (hash || "home").split("?");
+    let m;
+    if ((m = id.match(/^incident-(\d+)$/))) return { tab: byId.incidents, path: `/panel/incident/${m[1]}` };
+    if ((m = id.match(/^logs-([A-Za-z0-9_.-]{1,128})$/))) return { tab: byId.incidents, path: `/panel/logs/${m[1]}` };
+    const tab = byId[id] || byId.home;
+    return { tab, path: `/panel/${tab.id}` + (qs && tab.id === "incidents" ? `?${qs}` : "") };
+  }
+
   async function load(first) {
-    const t = current, my = ++seq;
+    const r0 = route, my = ++seq;
     try {
-      const r = await fetch(`/panel/${t.id}?_=${Date.now()}`, { cache: "no-store" });
+      const sep = r0.path.includes("?") ? "&" : "?";
+      const r = await fetch(`${r0.path}${sep}_=${Date.now()}`, { cache: "no-store" });
       if (!r.ok) throw new Error(`HTTP ${r.status}`);
       const html = await r.text();
-      if (my !== seq || t !== current) return;  // user switched tab meanwhile
+      if (my !== seq || r0 !== route) return;  // user switched page meanwhile
+      // keep opened log sections open and the scroll position of log boxes across refreshes
+      const opened = [...view.querySelectorAll("details[data-keep][open]")].map((d) => d.id);
+      const scrolls = Object.fromEntries([...view.querySelectorAll("pre.logs[id]")].map((p) => [p.id, p.scrollTop]));
       view.innerHTML = html;
+      opened.forEach((id) => { const d = document.getElementById(id); if (d) d.open = true; });
+      Object.entries(scrolls).forEach(([id, top]) => { const p = document.getElementById(id); if (p) p.scrollTop = top; });
       fillLinks(view);
       lastOk = Date.now();
       stamp.textContent = `Live · updated ${clock(new Date())}`;
@@ -68,20 +87,45 @@
   }
 
   function show() {
-    const id = (location.hash || "#home").slice(1);
-    const t = byId[id] || byId.home;
-    if (t === current) return;
-    current = t;
-    document.documentElement.style.setProperty("--accent", t.accent);
-    nav.querySelectorAll("a").forEach((a) => a.classList.toggle("on", a.dataset.id === t.id));
+    const hash = (location.hash || "#home").slice(1);
+    const next = resolve(hash);
+    if (route && next.path === route.path) return;
+    const tabChanged = next.tab !== current;
+    current = next.tab;
+    route = next;
+    document.documentElement.style.setProperty("--accent", current.accent);
+    nav.querySelectorAll("a").forEach((a) => a.classList.toggle("on", a.dataset.id === current.id));
     nav.querySelector(".on")?.scrollIntoView({ block: "nearest", inline: "nearest" });
-    head.innerHTML = t.id === "home" ? "" : `<h1>${t.name}</h1><p>${t.sub}</p>`;
-    view.innerHTML = `<p class="empty">Loading ${t.name}…</p>`;
-    window.scrollTo({ top: 0 });
+    head.innerHTML = current.id === "home" ? "" : `<h1>${current.name}</h1><p>${current.sub}</p>`;
+    if (tabChanged || !route.path.startsWith("/panel/incidents")) {
+      view.innerHTML = `<p class="empty">Loading ${current.name}…</p>`;
+      window.scrollTo({ top: 0 });
+    }
     clearInterval(timer);
     load(true);
-    if (t.every) timer = setInterval(() => { if (!document.hidden) load(false); }, t.every * 1000);
+    if (current.every) timer = setInterval(() => { if (!document.hidden) load(false); }, current.every * 1000);
   }
+
+  // Copy buttons (logs). navigator.clipboard needs https or localhost, so fall back to a hidden textarea.
+  document.addEventListener("click", async (ev) => {
+    const btn = ev.target.closest("[data-copy]");
+    if (!btn) return;
+    const src = document.getElementById(btn.dataset.copy);
+    if (!src) return;
+    const lines = src.querySelectorAll(":scope > span");  // logs: one span per line
+    const text = lines.length ? [...lines].map((s) => s.textContent).join("\n") : src.textContent;
+    let done = false;
+    try { if (navigator.clipboard && window.isSecureContext) { await navigator.clipboard.writeText(text); done = true; } } catch (e) { /* fall back */ }
+    if (!done) {
+      const ta = document.createElement("textarea");
+      ta.value = text; ta.setAttribute("readonly", ""); ta.style.position = "fixed"; ta.style.opacity = "0";
+      document.body.appendChild(ta); ta.select();
+      try { done = document.execCommand("copy"); } catch (e) { done = false; }
+      ta.remove();
+    }
+    btn.textContent = done ? "Copied ✓" : "Select and copy manually";
+    setTimeout(() => { btn.textContent = "Copy"; }, 2000);
+  });
 
   document.addEventListener("visibilitychange", () => { if (!document.hidden && current?.every) load(false); });
   window.addEventListener("hashchange", show);

@@ -15,6 +15,7 @@ from collections import deque
 from datetime import date, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+import incidents
 import links
 import panels
 
@@ -32,6 +33,10 @@ IMMICH_KEY = os.environ.get("IMMICH_API_KEY", "")
 GH_TOKEN = os.environ.get("DASH_GITHUB_TOKEN", "")
 GH_ORG = os.environ.get("GITHUB_ORG", "swastik-labs")
 GH_RUNNER = os.environ.get("GITHUB_RUNNER", "homelab-laptop")
+DATA_DIR = os.environ.get("DATA_DIR", "/data")
+NTFY = incidents.Notifier(os.environ.get("NTFY_URL"), os.environ.get("NTFY_TOKEN"),
+                          os.environ.get("NTFY_TOPIC") or "server-alerts",
+                          os.environ.get("DASHBOARD_PUBLIC_URL") or "http://192.168.31.125:3000")
 
 _cache = {}
 _cache_lock = threading.Lock()
@@ -184,7 +189,8 @@ def health_system():
             "uptime_seconds": 1_036_800 + int(time.time()) % 86400, "uptime": "12d 4h",
             "last_reboot": iso(time.time() - 1_036_800),
             "top1": f"java {jitter(6.2, 0.3)}%", "top2": f"immich {jitter(3.1, 0.3)}%", "top3": f"python3 {jitter(1.4, 0.3)}%",
-            "top_processes": [{"name": "java", "cpu": 6.2}, {"name": "immich", "cpu": 3.1}, {"name": "python3", "cpu": 1.4}],
+            "top_processes": [{"name": "java", "cpu": 6.2}, {"name": "immich", "cpu": 3.1}, {"name": "python3", "cpu": 1.4},
+                              {"name": "dockerd", "cpu": 0.9}, {"name": "beszel-agent", "cpu": 0.4}],
         }
     res = {}
     # CPU % and top processes from the delta since the previous call
@@ -204,7 +210,7 @@ def health_system():
         p = prev["procs"].get(pid)
         if p and dt > 0:
             usage[comm] = usage.get(comm, 0) + (ticks - p[1])
-    top = sorted(usage.items(), key=lambda kv: -kv[1])[:3]
+    top = sorted(usage.items(), key=lambda kv: -kv[1])[:5]
     top = [{"name": n, "cpu": round(100 * t * ncpu / dt, 1)} for n, t in top]
     prev.update(total=total, idle=idle, procs=procs)
     res["top_processes"] = top
@@ -469,6 +475,37 @@ def docker_get(path, timeout=5):
         c.close()
 
 
+def docker_raw(path, timeout=10):
+    c = UnixConn(DOCKER_SOCK, timeout)
+    try:
+        c.request("GET", path)
+        r = c.getresponse()
+        body = r.read()
+        if r.status != 200:
+            raise RuntimeError(f"docker {path.split('?')[0]}: HTTP {r.status}")
+        return body
+    finally:
+        c.close()
+
+
+def docker_events(since, until, container=None):
+    """Container lifecycle events (die/oom/restart/health) between two unix times."""
+    flt = {"type": ["container"], "event": ["die", "oom", "restart", "start", "stop", "kill", "health_status"]}
+    if container:
+        flt["container"] = [container]
+    q = urllib.parse.urlencode({"since": int(since), "until": int(until), "filters": json.dumps(flt)})
+    out = []
+    for line in docker_raw(f"/events?{q}", timeout=10).splitlines():
+        try:
+            e = json.loads(line)
+        except ValueError:
+            continue
+        attrs = (e.get("Actor") or {}).get("Attributes") or {}
+        out.append({"ts": e.get("timeNano", 0) / 1e9 or e.get("time", 0), "action": e.get("Action") or e.get("status") or "",
+                    "name": attrs.get("name", ""), "exit": attrs.get("exitCode")})
+    return out
+
+
 @cached(300)
 def docker_df():
     if MOCK:
@@ -502,8 +539,11 @@ def docker():
             cs.append({"name": n, "state": "running", "status": "Up 12 days", "uptime": "12d 4h", "restarts": r,
                        "mem_bytes": m, "mem": human_bytes(m), "summary": f"up 12d 4h · {human_bytes(m)} · {r} restarts",
                        "world": n in ("mc-1", "mc-2"), "image": "itzg/minecraft-server" if n.startswith("mc-") else ""})
-        for i, status in ((8, "Exited (0) 3 days ago"), (11, "Exited (0) 2 days ago"), (12, "Exited (143) 5 days ago")):
-            cs[i].update(state="exited", status=status, uptime=None, mem_bytes=0, mem="0 B", summary="exited")
+        for c in cs:
+            c.update(exit_code=None, oom=False, health=None, health_output=None)
+        for i, status, code in ((8, "Exited (0) 3 days ago", 0), (11, "Exited (0) 2 days ago", 0), (12, "Exited (143) 5 days ago", 143)):
+            cs[i].update(state="exited", status=status, uptime=None, mem_bytes=0, mem="0 B", summary="exited", exit_code=code)
+        cs[5].update(health="healthy")
         cs[10]["uptime"] = "3h 12m"
     else:
         cs = []
@@ -511,10 +551,18 @@ def docker():
             name = (c.get("Names") or ["?"])[0].lstrip("/")
             item = {"name": name, "state": c.get("State"), "status": c.get("Status"),
                     "uptime": None, "restarts": None, "mem_bytes": None, "mem": None,
-                    "world": (c.get("Labels") or {}).get("mcpanel") == "1", "image": c.get("Image") or ""}
+                    "world": (c.get("Labels") or {}).get("mcpanel") == "1", "image": c.get("Image") or "",
+                    "exit_code": None, "oom": False, "health": None, "health_output": None}
             try:
                 info = docker_get(f"/containers/{c['Id']}/json")
                 item["restarts"] = info.get("RestartCount")
+                stt = info.get("State") or {}
+                item.update(exit_code=stt.get("ExitCode"), oom=bool(stt.get("OOMKilled")))
+                hl = stt.get("Health") or {}
+                if hl:
+                    item["health"] = hl.get("Status")
+                    last = (hl.get("Log") or [{}])[-1]
+                    item["health_output"] = incidents.redact((last.get("Output") or "").strip())[-500:] or None
                 started = (info.get("State") or {}).get("StartedAt")
                 if item["state"] == "running" and started:
                     st = datetime.fromisoformat(started[:19] + "+00:00")
@@ -743,70 +791,325 @@ def ok(d):
 IGNORE_STOPPED = {x.strip() for x in os.environ.get("IGNORE_STOPPED_CONTAINERS", "extraction-service").split(",") if x.strip()}
 
 
-def attention_items():
-    """Everything that needs a look, worst first: [(level, what, detail)]."""
-    items = []
+RECENT_EVENTS = deque(maxlen=500)   # docker events seen by the monitor: {ts, action, name, exit}
+RESTART_SEEN = {}                    # container -> deque[(ts, restart count)]
+CRASH_WINDOW = 15 * 60
+
+
+def problems():
+    """Everything that needs a look, worst first. Drives the Home banner, incidents and phone alerts.
+
+    priority: urgent (app down, crash loop, OOM) / high / low (at most one phone alert a day)."""
+    out = []
+    now = time.time()
+
+    def add(key, kind, type_, target, level, priority, title, detail, tab, immediate=False, fingerprint=None):
+        out.append({"key": key, "kind": kind, "type": type_, "target": target, "level": level, "priority": priority,
+                    "title": title, "detail": detail, "tab": tab, "immediate": immediate,
+                    "fingerprint": fingerprint or detail})
+
+    d = docker()
+    if ok(d):
+        for c in d["containers"]:
+            name = c["name"]
+            hist = RESTART_SEEN.setdefault(name, deque(maxlen=50))
+            if c.get("restarts") is not None and (not hist or hist[-1][1] != c["restarts"]):
+                hist.append((now, c["restarts"]))
+            older = [r for t, r in hist if now - t > CRASH_WINDOW]
+            base = older[-1] if older else (hist[0][1] if hist else 0)
+            restarts_recent = (c.get("restarts") or 0) - base
+            deaths = [e for e in RECENT_EVENTS if e["name"] == name and e["action"] == "die" and now - e["ts"] < CRASH_WINDOW]
+            ooms = [e for e in RECENT_EVENTS if e["name"] == name and e["action"] == "oom" and now - e["ts"] < 600]
+            if c.get("off_ok"):
+                continue  # stopped MC Panel world or IGNORE_STOPPED_CONTAINERS
+            code = c.get("exit_code")
+            if ooms or (c["state"] != "running" and c.get("oom")):
+                add(f"oom:{name}", "container", "oom", name, BAD, "urgent", f"{name} ran out of memory",
+                    "killed by the kernel (OOM)", "docker", immediate=True, fingerprint=f"oom:{len(ooms)}")
+            elif c["state"] == "restarting" or len(deaths) >= 3 or restarts_recent >= 3:
+                n = max(len(deaths), restarts_recent)
+                add(f"crash_loop:{name}", "container", "crash_loop", name, BAD, "urgent", f"{name} is crash-looping",
+                    f"{n} restarts in 15 min" + (f", exit code {code}" if code is not None else ""), "docker",
+                    immediate=True, fingerprint=f"restarts:{c.get('restarts')}")
+            elif c["state"] != "running":
+                add(f"container_down:{name}", "container", "container_down", name, BAD, "urgent", f"{name} is down",
+                    c.get("status") or "stopped", "docker", fingerprint=f"exit:{code}")
+            elif c.get("health") == "unhealthy":
+                add(f"unhealthy:{name}", "container", "unhealthy", name, BAD, "high", f"{name} is unhealthy",
+                    (c.get("health_output") or "health check failing")[:160], "docker", fingerprint="unhealthy")
     s = health_system()
     s = s if ok(s) else {}
     t = s.get("cpu_temp_c")
-    if t is not None and t >= 75:
-        items.append((lvl(t, 75, 90), "Processor is hot", f"{t:.0f} °C"))
-    for key, name, warn, bad in (("ram_percent", "Memory almost full", 80, 92), ("disk_percent", "Disk almost full", 80, 90)):
+    if t is not None and t >= 80:
+        add("cpu_hot", "metric", "cpu_hot", "CPU temperature", lvl(t, 80, 90), "high", "Processor is hot", f"{t:.0f} °C",
+            "health", fingerprint=f"{t // 5}")
+    for key, name, title, warn, bad in (("ram_percent", "ram_high", "Memory almost full", 90, 95),
+                                         ("disk_percent", "disk_high", "Disk almost full", 85, 95)):
         v = s.get(key)
         if v is not None and v >= warn:
-            items.append((lvl(v, warn, bad), name, f"{v:.0f} % used"))
+            add(name, "metric", name, "RAM" if name == "ram_high" else "Disk", lvl(v, warn, bad), "high", title,
+                f"{v:.0f} % used", "health", fingerprint=f"{v // 5}")
     ssd = health_ssd()
     t = ssd.get("nvme_temp_c") if ok(ssd) else None
-    if t is not None and t >= 60:
-        items.append((lvl(t, 60, 70), "SSD is hot", f"{t:.0f} °C"))
+    if t is not None and t >= 65:
+        add("ssd_hot", "metric", "ssd_hot", "SSD temperature", lvl(t, 65, 75), "high", "SSD is hot", f"{t:.0f} °C", "health",
+            fingerprint=f"{t // 5}")
     b = health_battery()
     if ok(b) and (b.get("status") or "").lower() == "discharging":
-        items.append((BAD, "Running on battery", f"{b.get('charge_percent') or '?'} % left, check the charger / power"))
+        add("on_battery", "system", "on_battery", "Battery", BAD, "high", "Running on battery",
+            f"{b.get('charge_percent') or '?'} % left, check the charger / power", "health", fingerprint="batt")
     u = health_updates()
     if ok(u):
         if u.get("reboot_required") == "yes":
-            items.append((WARN, "Restart needed", u.get("reboot_pkgs") or "after updates"))
+            add("reboot", "system", "reboot", "Ubuntu", WARN, "low", "Restart needed", u.get("reboot_pkgs") or "after updates", "health")
         n, sec_n = u.get("updates") or 0, u.get("security_updates") or 0
         if n:
-            items.append((WARN, "Updates waiting", f"{n} update{'s' if n != 1 else ''}" + (f", {sec_n} security" if sec_n else "")))
+            add("updates", "system", "updates", "Ubuntu", WARN, "low", "Updates waiting",
+                f"{n} update{'s' if n != 1 else ''}" + (f", {sec_n} security" if sec_n else ""), "health", fingerprint="updates")
     sec = security()
     if ok(sec):
         f = sec.get("failed_ssh_24h")
         if f:
-            items.append((lvl(f, 1, 20), "Failed SSH logins", f"{f} in the last 24 h"))
+            add("ssh_failed", "system", "ssh_failed", "SSH", lvl(f, 1, 20), "high" if f >= 20 else "low", "Failed SSH logins",
+                f"{f} in the last 24 h", "security", fingerprint="many" if f >= 20 else "few")
         if sec.get("ufw") == "disabled":
-            items.append((WARN, "Firewall is off", "ufw disabled, low risk at home"))
+            add("firewall_off", "system", "firewall_off", "ufw", WARN, "low", "Firewall is off", "ufw disabled, low risk at home", "security")
         if sec.get("playit") == "stopped":
-            items.append((BAD, "playit tunnel is down", "playitd not running"))
-    d = docker()
-    if ok(d):
-        for c in d["containers"]:
-            if c["name"] in d["down"]:
-                items.append((BAD, f"{c['name']} is down", c.get("status") or "stopped"))
+            add("playit_down", "system", "playit_down", "playitd", BAD, "high", "playit tunnel is down", "playitd not running", "security")
     tr = tracker()
     if ok(tr) and tr.get("status") in ("stopped", "stale"):
-        items.append((BAD if tr["status"] == "stopped" else WARN, "Energy tracker",
-                      "stopped" if tr["status"] == "stopped" else "no new reading"))
+        stopped = tr["status"] == "stopped"
+        add("tracker", "system", "tracker", "energy tracker", BAD if stopped else WARN, "high" if stopped else "low",
+            "Energy tracker " + ("stopped" if stopped else "is stuck"), "stopped" if stopped else "no new reading", "bots",
+            fingerprint=tr["status"])
     g = github()
     if isinstance(g, dict):
         if g.get("runner_status") == "offline":
-            items.append((BAD, "GitHub runner offline", g.get("runner") or ""))
+            add("runner_offline", "system", "runner_offline", g.get("runner") or "runner", BAD, "high", "GitHub runner offline",
+                g.get("runner") or "", "bots")
         if g.get("last_run_status") in ("failure", "timed_out"):
-            items.append((BAD, "Last deploy failed", g.get("last_run_repo") or ""))
+            add("deploy_failed", "system", "deploy_failed", g.get("last_run_repo") or "deploy", BAD, "high", "Last deploy failed",
+                g.get("last_run_repo") or "", "bots", fingerprint=g.get("last_run_at"))
     order = {BAD: 0, WARN: 1}
-    return [(lv, what, detail, tab_for(what)) for lv, what, detail in sorted(items, key=lambda x: order.get(x[0], 2))]
+    return sorted(out, key=lambda p: order.get(p["level"], 2))
 
 
-def tab_for(what):
-    w = what.lower()
-    if " is down" in w:
-        return "docker"
-    if "ssh" in w or "firewall" in w or "playit" in w:
-        return "security"
-    if "tracker" in w or "runner" in w or "deploy" in w:
-        return "bots"
-    return "health"
+def attention_items():
+    """Home banner: (level, what, detail, tab)."""
+    return [(p["level"], p["title"], p["detail"], p["tab"]) for p in problems()]
 
+
+# ---------------------------------------------------------------- incidents: evidence + monitor
+def mock_logs(name, kind):
+    if name == "mc-server":
+        return "\n".join([
+            "2026-11-19T08:01:12.120Z [init] Running as uid=1000 gid=1000",
+            "2026-11-19T08:01:20.501Z [Server thread/INFO]: Starting minecraft server version 1.21.1",
+            "2026-11-19T08:01:44.930Z [Server thread/INFO]: Done (24.4s)! For help, type \"help\"",
+            "2026-11-19T21:15:02.004Z [mc-server-runner] Stopping with rcon-cli",
+            "2026-11-19T21:15:02.880Z [Server thread/INFO]: Stopping the server",
+            "2026-11-19T21:15:03.412Z [Server thread/INFO]: Saving worlds",
+            "2026-11-19T21:15:05.002Z [Server thread/ERROR]: Failed to save chunk [12, -4]: java.io.IOException: No space left on device",
+            "2026-11-19T21:15:05.300Z [mc-server-runner] Done"])
+    return "2026-11-24T02:10:00.000Z INFO started\n2026-11-24T02:10:01.000Z INFO ready"
+
+
+def capture_container(p):
+    name, typ = p["target"], p["type"]
+    ev, logs, events = {"container": name}, "", []
+    try:
+        if MOCK:
+            c = next((x for x in docker()["containers"] if x["name"] == name), {})
+            ev.update(image=c.get("image") or "", state=c.get("state"), exit_code=c.get("exit_code"), oom=c.get("oom"),
+                      restarts=c.get("restarts"), health=c.get("health"), health_output=c.get("health_output"))
+            logs = mock_logs(name, typ)
+        else:
+            info = docker_get(f"/containers/{urllib.parse.quote(name)}/json")
+            st = info.get("State") or {}
+            hl = st.get("Health") or {}
+            ev.update(image=(info.get("Config") or {}).get("Image") or "", state=st.get("Status"), exit_code=st.get("ExitCode"),
+                      oom=bool(st.get("OOMKilled")), restarts=info.get("RestartCount"), error=st.get("Error") or None,
+                      started_at=st.get("StartedAt"), finished_at=st.get("FinishedAt"), health=hl.get("Status"),
+                      health_output=incidents.redact(((hl.get("Log") or [{}])[-1].get("Output") or "").strip())[-1000:] or None)
+            raw = docker_raw(f"/containers/{urllib.parse.quote(name)}/logs?stdout=1&stderr=1&tail=150&timestamps=1")
+            logs = incidents.demux_docker_logs(raw)
+            now = time.time()
+            for e in docker_events(now - 3600, now, name)[-40:]:
+                what = {"die": f"Container stopped (exit {e['exit']})" if e["exit"] is not None else "Container stopped",
+                        "oom": "Killed: out of memory", "restart": "Docker restarted it", "start": "Container started",
+                        "stop": "Container was stopped", "kill": "Container was killed"}.get(e["action"], e["action"])
+                events.append({"ts": e["ts"], "text": what})
+    except Exception as e:
+        ev["capture_error"] = str(e)[:200]
+    logs = incidents.redact(logs)
+    idx, headline = incidents.find_error(logs.splitlines())
+    ev["error_line"] = idx
+    code = ev.get("exit_code")
+    meaning = incidents.exit_meaning(code)
+    summary = {
+        "crash_loop": f"{name} keeps crashing and Docker keeps restarting it ({p['detail']}). Exit code {code}: {meaning}.",
+        "container_down": f"{name} stopped and didn't come back. Exit code {code}: {meaning}.",
+        "oom": f"{name} used more memory than it was allowed, so the kernel killed it.",
+        "unhealthy": f"{name} is running, but its own health check says it isn't working.",
+    }.get(p["type"], p["detail"])
+    if headline:
+        summary += " The logs point to the line shown above."
+    return {"summary": summary, "headline": headline or (ev.get("health_output") if p["type"] == "unhealthy" else None),
+            "evidence": ev, "logs": logs, "events": events}
+
+
+def capture_metric(p):
+    s = health_system()
+    s = s if ok(s) else {}
+    col = {"cpu_hot": 3, "ram_high": 2}.get(p["type"])
+    hist = history()
+    series = [(h[0], h[col]) for h in hist if h[0] > time.time() - 3600 and h[col] is not None] if col else []
+    d = docker()
+    tops = sorted([c for c in (d.get("containers") or []) if c.get("mem_bytes")], key=lambda c: -c["mem_bytes"])[:5] if ok(d) else []
+    ev = {"metric": p["type"], "value": p["detail"], "series": series,
+          "top_processes": (s.get("top_processes") or [])[:5],
+          "top_containers": [{"name": c["name"], "mem_bytes": c["mem_bytes"]} for c in tops]}
+    if p["type"] == "disk_high" and ok(d):
+        ev["docker_disk"] = {"images": d.get("disk_images"), "volumes": d.get("disk_volumes"),
+                             "build_cache": d.get("disk_build_cache"), "reclaimable": d.get("disk_reclaimable")}
+    limit = {"cpu_hot": "80 °C", "ram_high": "90 %", "disk_high": "85 %", "ssd_hot": "65 °C"}.get(p["type"])
+    summary = f"{p['title']}: {p['detail']}" + (f" (alert from {limit})." if limit else ".")
+    if p["kind"] == "system":
+        summary = f"{p['title']}: {p['detail']}."
+    return {"summary": summary, "headline": None, "evidence": ev, "logs": ""}
+
+
+def capture(p):
+    return capture_container(p) if p["kind"] == "container" else capture_metric(p)
+
+
+STORE = incidents.Store(DATA_DIR)
+MONITOR = incidents.Monitor(STORE, NTFY, capture)
+
+
+def seed_mock_incidents():
+    """Realistic examples for MOCK mode, including the real send_default_pii crash loop."""
+    if STORE.count():
+        return
+    now = time.time()
+    tb = [
+        "INFO discord.client logging in using static token",
+        "INFO bot Loading cogs: music, moderation, error_handler",
+        "Traceback (most recent call last):",
+        '  File "/app/bot.py", line 58, in setup_hook',
+        '    await self.load_extension("cogs.error_handler")',
+        '  File "/usr/local/lib/python3.12/site-packages/discord/ext/commands/bot.py", line 1013, in load_extension',
+        "    await self._load_from_module_spec(spec, name)",
+        '  File "/app/cogs/error_handler.py", line 14, in setup',
+        "    sentry_sdk.init(dsn=SENTRY_DSN, send_default_pii=True, traces_sample_rate=0.2)",
+        '  File "/usr/local/lib/python3.12/site-packages/sentry_sdk/client.py", line 112, in _get_options',
+        "    raise TypeError(\"Unknown option '%s'\" % key)",
+        "TypeError: Unknown option 'send_default_pii'",
+        "ERROR bot Fatal error during startup, exiting with code 1"]
+    lines = []
+    t = now - 86400 - 3600
+    for i in range(7):
+        for l in tb:
+            lines.append(time.strftime("%Y-%m-%dT%H:%M:%S.000Z ", time.gmtime(t + i * 380)) + l)
+    lines.insert(1, time.strftime("%Y-%m-%dT%H:%M:%S.000Z ", time.gmtime(t)) +
+                 "DEBUG config token=MTIzNDU2Nzg5MDEyMzQ1Njc4OQ.GhIjKl.abcdefghijklmnopqrstuvwxyz0123456789AB")
+    logs = incidents.redact("\n".join(lines))
+    idx, head = incidents.find_error(logs.splitlines())
+    start = now - 86400 - 3600
+    tl = [{"ts": start, "text": "Problem first noticed: 3 restarts in 15 min, exit code 1"},
+          {"ts": start + 20, "text": "Alert sent to phone"}]
+    tl += [{"ts": start - 760 + i * 380, "text": "Container stopped (exit 1)"} for i in range(7)]
+    tl += [{"ts": start + 1500, "text": "Changed: 7 restarts in 15 min, exit code 1"},
+           {"ts": start + 2760, "text": "Back to normal"}, {"ts": start + 2765, "text": "Resolved message sent to phone"}]
+    STORE.create({"key": "crash_loop:pvt-discord-bot", "kind": "container", "type": "crash_loop", "target": "pvt-discord-bot",
+                  "severity": BAD, "priority": "urgent", "title": "pvt-discord-bot is crash-looping",
+                  "summary": "pvt-discord-bot keeps crashing and Docker keeps restarting it (7 restarts in 15 min, exit code 1). "
+                             "Exit code 1: the app crashed with an error. The logs point to the line shown above.",
+                  "headline": head, "status": "resolved", "started": start, "ended": start + 2760, "last_notified": start + 20,
+                  "evidence": {"container": "pvt-discord-bot", "image": "pvt-discord-bot:latest", "state": "restarting",
+                               "exit_code": 1, "oom": False, "restarts": 7, "health": None, "error_line": idx,
+                               "timeline": sorted(tl, key=lambda x: x["ts"])},
+                  "logs": logs})
+    ser = [(now - 3 * 86400 - 3600 + i * 120, round(62 + i * 0.9 + random.uniform(-1, 1), 1)) for i in range(31)]
+    STORE.create({"key": "cpu_hot", "kind": "metric", "type": "cpu_hot", "target": "CPU temperature", "severity": BAD,
+                  "priority": "high", "title": "Processor is hot", "summary": "Processor is hot: 91 °C (alert from 80 °C).",
+                  "headline": None, "status": "resolved", "started": now - 3 * 86400 - 3600 + 1800,
+                  "ended": now - 3 * 86400 - 3600 + 1800 + 2520, "last_notified": now - 3 * 86400,
+                  "evidence": {"metric": "cpu_hot", "value": "91 °C", "series": ser,
+                               "top_processes": [{"name": "java", "cpu": 184.0}, {"name": "immich", "cpu": 61.5},
+                                                 {"name": "ffmpeg", "cpu": 48.2}, {"name": "python3", "cpu": 3.1},
+                                                 {"name": "dockerd", "cpu": 1.2}],
+                               "top_containers": [{"name": "mc-2", "mem_bytes": 1.9e9}, {"name": "immich_server", "mem_bytes": 6.1e8},
+                                                  {"name": "immich_postgres", "mem_bytes": 1.3e8}],
+                               "timeline": [{"ts": now - 3 * 86400 - 1800, "text": "Problem first noticed: 84 °C"},
+                                            {"ts": now - 3 * 86400 - 1740, "text": "Alert sent to phone"},
+                                            {"ts": now - 3 * 86400 + 720, "text": "Back to normal"}]}})
+    STORE.create({"key": "disk_high", "kind": "metric", "type": "disk_high", "target": "Disk", "severity": WARN, "priority": "high",
+                  "title": "Disk almost full", "summary": "Disk almost full: 87 % used (alert from 85 %).", "headline": None,
+                  "status": "resolved", "started": now - 12 * 86400, "ended": now - 12 * 86400 + 5400,
+                  "evidence": {"metric": "disk_high", "value": "87 % used", "series": [],
+                               "docker_disk": {"images": 14.2e9, "volumes": 3.1e9, "build_cache": 6.8e9, "reclaimable": 9.4e9},
+                               "timeline": [{"ts": now - 12 * 86400, "text": "Problem first noticed: 87 % used"},
+                                            {"ts": now - 12 * 86400 + 5400, "text": "Back to normal"}]}})
+    started = now - 5 * 86400 + 3600
+    cap = capture_container({"target": "mc-server", "type": "container_down", "detail": "Exited (143) 5 days ago"})
+    ev = dict(cap["evidence"], fingerprint="exit:143",
+              timeline=[{"ts": started - 2, "text": "Container stopped (exit 143)"},
+                        {"ts": started, "text": "Problem first noticed: Exited (143) 5 days ago"},
+                        {"ts": started + 60, "text": "Alert sent to phone"}])
+    STORE.create({"key": "container_down:mc-server", "kind": "container", "type": "container_down", "target": "mc-server",
+                  "severity": BAD, "priority": "urgent", "title": "mc-server is down", "summary": cap["summary"],
+                  "headline": cap["headline"], "status": "open", "started": started, "last_notified": started + 60,
+                  "evidence": ev, "logs": cap["logs"]})
+
+
+def monitor_loop():
+    """Every 30 s: read new Docker events, compare problems with open incidents, alert by ntfy."""
+    if MOCK:
+        seed_mock_incidents()
+    last = time.time() - 60
+    print(f"incidents: {'saved in ' + DATA_DIR if STORE.persistent else 'memory only'}; "
+          f"phone alerts {'on (topic ' + NTFY.topic + ')' if NTFY.enabled else 'off (NTFY_URL/NTFY_TOKEN not set)'}", flush=True)
+    while True:
+        now = time.time()
+        if not MOCK:
+            try:
+                RECENT_EVENTS.extend(docker_events(last, now))
+                last = now
+            except Exception as e:
+                print(f"docker events failed: {str(e)[:120]}", flush=True)
+        try:
+            for f in (docker, health_system):  # fresh state for detection
+                _cache.pop(f.__name__, None)
+            MONITOR.tick(problems(), now)
+        except Exception as e:
+            print(f"incident monitor failed: {type(e).__name__}: {str(e)[:160]}", flush=True)
+        time.sleep(30)
+
+
+def incident_list_page(query):
+    q = urllib.parse.parse_qs(query)
+    status = (q.get("status") or ["all"])[0]
+    kind = (q.get("type") or ["all"])[0]
+    rng = (q.get("range") or ["7d"])[0]
+    secs = {"24h": 86400, "7d": 7 * 86400, "30d": 30 * 86400}.get(rng, 7 * 86400)
+    items = STORE.list(since=time.time() - secs, status=status if status in ("open", "resolved") else None,
+                       kind=kind if kind in ("container", "metric", "system") else None)
+    return panels.panel_incidents(items, {"status": status, "type": kind, "range": rng}, NTFY.enabled, STORE.persistent)
+
+
+def container_logs_page(name):
+    d = docker()
+    if not (ok(d) and any(c["name"] == name for c in d["containers"])):
+        return panels.page("incidents", '<p class="empty">No container with that name.</p>')
+    if MOCK:
+        logs = mock_logs(name, "")
+    else:
+        logs = incidents.demux_docker_logs(
+            docker_raw(f"/containers/{urllib.parse.quote(name)}/logs?stdout=1&stderr=1&tail=200&timestamps=1"))
+    logs = incidents.redact(logs)
+    idx, head = incidents.find_error(logs.splitlines())
+    return panels.panel_logs(name, logs, idx, head)
 
 
 # ---------------------------------------------------------------- auto-discovered links (Links tab, Home buttons)
@@ -866,6 +1169,7 @@ ROUTES = {
     "/health/updates": health_updates, "/energy": energy, "/traffic": traffic, "/docker": docker,
     "/immich": immich, "/github": github, "/security": security, "/tracker": tracker,
     "/links": links_data,
+    "/problems": problems,
 }
 
 
@@ -877,6 +1181,15 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if path in STATIC:
                 body, ctype = static_file(path)
+            elif path == "/panel/incidents":
+                body, ctype = incident_list_page(self.path.partition("?")[2]).encode(), "text/html; charset=utf-8"
+            elif re.fullmatch(r"/panel/incident/\d+", path):
+                inc = STORE.get(int(path.rsplit("/", 1)[1]))
+                body, ctype = panels.panel_incident(inc, NTFY.enabled).encode(), "text/html; charset=utf-8"
+            elif re.fullmatch(r"/panel/logs/[A-Za-z0-9_.-]{1,128}", path):
+                body, ctype = container_logs_page(path.rsplit("/", 1)[1]).encode(), "text/html; charset=utf-8"
+            elif path == "/incidents":
+                body, ctype = json.dumps(STORE.list(since=time.time() - 30 * 86400)).encode(), "application/json"
             elif path.startswith("/panel/") and path[7:] in PANEL_RENDERERS:
                 body, ctype = PANEL_RENDERERS[path[7:]]().encode(), "text/html; charset=utf-8"
             elif path == "/healthz":
@@ -944,7 +1257,8 @@ PANEL_RENDERERS = {
     "docker": lambda: panels.panel_docker(docker()),
     "security": lambda: panels.panel_security(security()),
     "home": lambda: panels.panel_home(health_system(), health_battery(), history(), energy(), *_rows_with_live(),
-                                      traffic(), docker(), immich(), github(), attention_items(), links_data()),
+                                      traffic(), docker(), immich(), github(), attention_items(), links_data(),
+                                      STORE.list(since=time.time() - 7 * 86400, limit=5)),
     "links": lambda: panels.panel_links(links_data()),
 }
 
@@ -976,4 +1290,5 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", "3000"))
     print(f"server-api on :{port} (MOCK={MOCK})", flush=True)
     threading.Thread(target=sampler, daemon=True).start()
+    threading.Thread(target=monitor_loop, daemon=True).start()
     ThreadingHTTPServer(("0.0.0.0", port), Handler).serve_forever()

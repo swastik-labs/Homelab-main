@@ -130,3 +130,46 @@ main{max-width:1360px;margin:0 auto;padding:6px 20px 40px}
 .lgroup h2{display:flex;align-items:center;gap:8px;margin:0;font-size:16px;color:#e2e8f0}
 .lgroup h2 small{font-size:12px;color:#64748b;font-weight:600}
 .lgroup>p{margin:2px 0 10px 26px;color:#94a3b8;font-size:13px}
+
+/* ---- incidents ---- */
+.filters{display:flex;flex-wrap:wrap;align-items:center;gap:6px;margin:16px 0 10px}
+.filters .fl{color:#64748b;font-size:12px;font-weight:700;text-transform:uppercase;letter-spacing:.05em;margin:0 4px 0 10px}
+.filters .fl:first-child{margin-left:0}
+.chip{font-size:13px;padding:5px 11px;border-radius:99px;text-decoration:none;color:#cbd5e1;border:1px solid rgba(255,255,255,.1)}
+.chip:hover{border-color:rgba(148,163,184,.5)}
+.chip.on{color:#0b1220;background:var(--accent);border-color:var(--accent);font-weight:700}
+.ilist{display:flex;flex-direction:column;gap:8px}
+.irow{display:flex;gap:12px;align-items:flex-start;padding:12px 14px;border-radius:12px;text-decoration:none;color:inherit;
+  background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.07);border-left:4px solid var(--c)}
+.irow:hover{border-color:rgba(148,163,184,.4);border-left-color:var(--c)}
+.irow.open{background:color-mix(in srgb,var(--c) 7%,rgba(255,255,255,.03))}
+.iic{flex:none;width:38px;height:38px;border-radius:10px;display:grid;place-items:center;background:color-mix(in srgb,var(--c) 16%,transparent)}
+.ibody{min-width:0;display:flex;flex-direction:column;gap:3px}
+.ititle{display:flex;flex-wrap:wrap;align-items:center;gap:8px}.ititle b{font-size:15px}
+.iprio{font-size:11.5px;color:#94a3b8;font-weight:600}
+.ihead{font:12.5px/1.4 ui-monospace,SFMono-Regular,Consolas,monospace;color:#fca5a5;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.imeta{font-size:12.5px;color:#94a3b8}
+.ilist.compact .irow{padding:9px 12px}
+.seclink{float:right;text-transform:none;letter-spacing:0;font-weight:600;color:#94a3b8;text-decoration:none}
+.back{display:inline-block;margin-bottom:10px;color:#94a3b8;text-decoration:none;font-size:13px}.back:hover{color:#e2e8f0}
+.ihero{display:flex;gap:14px;align-items:center;padding:16px 18px;border-radius:14px;margin-bottom:12px;
+  background:color-mix(in srgb,var(--c) 12%,rgba(255,255,255,.03));border:1px solid color-mix(in srgb,var(--c) 40%,transparent)}
+.ihero h2{margin:0;font-size:21px;display:flex;flex-wrap:wrap;align-items:center;gap:10px}.ihero p{margin:3px 0 0;color:#cbd5e1}
+.errbox{margin-bottom:12px;padding:12px 16px;border-radius:12px;background:rgba(248,113,113,.1);border:1px solid rgba(248,113,113,.4)}
+.errbox span{display:block;font-size:11.5px;font-weight:700;letter-spacing:.06em;text-transform:uppercase;color:#fca5a5;margin-bottom:4px}
+.errbox code{font:600 15px/1.45 ui-monospace,SFMono-Regular,Consolas,monospace;color:#fecaca;word-break:break-word;white-space:pre-wrap}
+.timeline{list-style:none;margin:0;padding:0 0 0 4px;border-left:2px solid rgba(148,163,184,.25)}
+.timeline li{position:relative;padding:4px 0 8px 16px;display:flex;flex-direction:column;font-size:13.5px}
+.timeline li::before{content:"";position:absolute;left:-6px;top:9px;width:10px;height:10px;border-radius:50%;background:var(--accent)}
+.timeline .tt{font-size:12px;color:#94a3b8}
+.logdet summary{cursor:pointer;color:#cbd5e1;font-weight:600;padding:4px 0}
+.logbar{display:flex;justify-content:space-between;align-items:center;margin:8px 0 6px;font-size:12px;color:#94a3b8}
+.copy{font:inherit;font-weight:700;color:#0b1220;background:#e2e8f0;border:0;border-radius:7px;padding:5px 12px;cursor:pointer}
+pre.logs{margin:0;max-height:520px;overflow:auto;padding:12px 14px;border-radius:10px;background:#060b16;border:1px solid rgba(255,255,255,.07);
+  font:12.5px/1.5 ui-monospace,SFMono-Regular,Consolas,monospace;color:#cbd5e1;white-space:pre-wrap;word-break:break-word}
+pre.logs.small{max-height:160px;margin-top:6px}
+pre.logs span{display:block}
+pre.logs .warnl{color:#fcd34d}
+pre.logs .errl{color:#fff;background:rgba(248,113,113,.28);border-left:3px solid #f87171;padding-left:6px;margin-left:-9px;font-weight:600}
+.errbox code{background:none;padding:0}
+pre.logs span:empty::before{content:" "}
