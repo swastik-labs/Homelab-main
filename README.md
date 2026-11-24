@@ -132,11 +132,12 @@ private ntfy. When it has been gone for 60 s, the incident is resolved and you g
 |---|---|
 | **Urgent** | an app/bot is down, crash-looping (3+ restarts in 15 min) or killed for running out of memory |
 | **High** | app unhealthy, CPU ≥ 80 °C, SSD ≥ 65 °C, RAM ≥ 90 %, disk ≥ 85 %, running on battery, playit down, energy tracker stopped, runner offline, deploy failed, 20+ failed SSH logins |
-| **Low** | updates waiting, restart needed, firewall off, a few failed SSH logins, energy tracker stuck. At most one phone alert per problem per day. |
+| **Not alerted** | updates waiting, restart needed, a few failed SSH logins, energy tracker stuck. These never ring, open an incident or appear in Home's banner; they're shown on their own tabs (Server health, Security, Bots). The firewall being off is never treated as a problem. |
 
-- One message per problem, a reminder every 3 h while it lasts (low priority: once a day),
+- One message per problem, a reminder every 3 h while it lasts,
   and tapping the alert opens the incident on the dashboard (`/#incidents/<id>`).
 - Stopped MC Panel worlds and `IGNORE_STOPPED_CONTAINERS` never alert.
+- Urgent and high alerts use ntfy priority 5 and 4, so the phone rings.
 - **Evidence for apps:** exit code and what it means, out-of-memory kill, restart count,
   health status and the last health-check output, Docker events (die/restart/oom), and the
   last 150 log lines. The line that explains the failure (the final exception of a Python

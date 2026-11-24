@@ -204,6 +204,13 @@ class Store:
         with self.lock:
             return self.db.execute("SELECT COUNT(*) FROM incidents").fetchone()[0]
 
+    def delete_low(self):
+        with self.lock:
+            n = self.db.execute("DELETE FROM incidents WHERE priority='low'").rowcount
+            self.db.execute("DELETE FROM kv WHERE k LIKE 'lowsent:%'")
+            self.db.commit()
+        return n
+
     def kv_get(self, k, default=None):
         with self.lock:
             r = self.db.execute("SELECT v FROM kv WHERE k=?", (k,)).fetchone()

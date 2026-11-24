@@ -876,8 +876,7 @@ def problems():
         if f:
             add("ssh_failed", "system", "ssh_failed", "SSH", lvl(f, 1, 20), "high" if f >= 20 else "low", "Failed SSH logins",
                 f"{f} in the last 24 h", "security", fingerprint="many" if f >= 20 else "few")
-        if sec.get("ufw") == "disabled":
-            add("firewall_off", "system", "firewall_off", "ufw", WARN, "low", "Firewall is off", "ufw disabled, low risk at home", "security")
+        # firewall off is a deliberate choice here: shown on the Security tab, never alerted
         if sec.get("playit") == "stopped":
             add("playit_down", "system", "playit_down", "playitd", BAD, "high", "playit tunnel is down", "playitd not running", "security")
     tr = tracker()
@@ -898,9 +897,15 @@ def problems():
     return sorted(out, key=lambda p: order.get(p["level"], 2))
 
 
+def important(problems_):
+    """Only problems worth interrupting for. Low-priority ones (updates waiting, restart needed, a few failed
+    SSH logins, a stuck tracker) stay visible on their own tabs, but never alert, pin or open an incident."""
+    return [p for p in problems_ if p["priority"] != "low"]
+
+
 def attention_items():
     """Home banner: (level, what, detail, tab)."""
-    return [(p["level"], p["title"], p["detail"], p["tab"]) for p in problems()]
+    return [(p["level"], p["title"], p["detail"], p["tab"]) for p in important(problems())]
 
 
 # ---------------------------------------------------------------- incidents: evidence + monitor
@@ -1057,7 +1062,7 @@ def seed_mock_incidents():
     # 3. resolved, minor: restarted after the server rebooted
     t1 = now - 4 * 86400 - 2 * 3600
     STORE.create({"key": "container_down:immich_server", "kind": "container", "type": "container_down", "target": "immich_server",
-                  "severity": WARN, "priority": "low", "title": "immich_server restarted",
+                  "severity": WARN, "priority": "high", "title": "immich_server restarted",
                   "summary": "Restarted after server reboot. No errors in logs.", "headline": None, "status": "resolved",
                   "started": t1, "ended": t1 + 140,
                   "evidence": {"container": "immich_server", "image": "ghcr.io/immich-app/immich-server:v2.3.1", "state": "exited",
@@ -1080,6 +1085,9 @@ def monitor_loop():
     """Every 30 s: read new Docker events, compare problems with open incidents, alert by ntfy."""
     if MOCK:
         seed_mock_incidents()
+    removed = STORE.delete_low()  # low-priority incidents from older versions: remove quietly, no "resolved" ping
+    if removed:
+        print(f"incidents: removed {removed} low-priority incident(s)", flush=True)
     last = time.time() - 60
     print(f"incidents: {'saved in ' + DATA_DIR if STORE.persistent else 'memory only'}; "
           f"phone alerts {'on (topic ' + NTFY.topic + ')' if NTFY.enabled else 'off (NTFY_URL/NTFY_TOKEN not set)'}", flush=True)
@@ -1094,7 +1102,7 @@ def monitor_loop():
         try:
             for f in (docker, health_system):  # fresh state for detection
                 _cache.pop(f.__name__, None)
-            MONITOR.tick(problems(), now)
+            MONITOR.tick(important(problems()), now)
         except Exception as e:
             print(f"incident monitor failed: {type(e).__name__}: {str(e)[:160]}", flush=True)
         time.sleep(30)
