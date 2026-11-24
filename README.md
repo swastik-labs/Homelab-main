@@ -132,11 +132,14 @@ private ntfy. When it has been gone for 60 s, the incident is resolved and you g
 |---|---|
 | **Urgent** | an app/bot is down, crash-looping (3+ restarts in 15 min) or killed for running out of memory |
 | **High** | app unhealthy, CPU ≥ 80 °C, SSD ≥ 65 °C, RAM ≥ 90 %, disk ≥ 85 %, running on battery, playit down, energy tracker stopped, runner offline, deploy failed, 20+ failed SSH logins |
-| **Not alerted** | updates waiting, restart needed, a few failed SSH logins, energy tracker stuck. These never ring, open an incident or appear in Home's banner; they're shown on their own tabs (Server health, Security, Bots). The firewall being off is never treated as a problem. |
+| **Home only** | updates waiting, restart needed, firewall off, a few failed SSH logins, energy tracker stuck. Ongoing states, not incidents: shown in amber on Home's banner, never in the Incidents tab and never sent to the phone. |
 
 - One message per problem, a reminder every 3 h while it lasts,
   and tapping the alert opens the incident on the dashboard (`/#incidents/<id>`).
 - Stopped MC Panel worlds and `IGNORE_STOPPED_CONTAINERS` never alert.
+- One-off containers (Docker's random names like `nice_mcnulty`, no compose project, stopped after
+  running under 2 minutes, e.g. from `docker run --rm`) never create incidents; the Docker tab shows
+  them as "One-off run, finished" while they exist.
 - Urgent and high alerts use ntfy priority 5 and 4, so the phone rings.
 - **Evidence for apps:** exit code and what it means, out-of-memory kill, restart count,
   health status and the last health-check output, Docker events (die/restart/oom), and the
@@ -161,9 +164,10 @@ private ntfy. When it has been gone for 60 s, the incident is resolved and you g
 Some containers fail on purpose (e.g. a staging environment that restarts all the time).
 Every incident has an **Ignore…** menu:
 
-- **Ignore this container**: no more incidents, alerts or Home banner items for it. Its old
-  incidents move to the **Ignored** filter. It still shows its real state on the Docker and
-  Bots tabs, but grey with an "ignored" tag, never red.
+- **Ignore this container**: no more incidents or phone alerts for it, and its old incidents
+  move to the **Ignored** filter. It still shows its real state on Home's banner (grey, marked
+  "ignored", not counted as needing attention) and on the Docker and Bots tabs (grey with an
+  "ignored" tag, never red).
 - **Ignore this error everywhere**: any incident whose error line matches (numbers, ids, hex
   and timestamps don't matter).
 - **Mute for 1 h / 8 h / 24 h / 7 days**: the same, but temporary.

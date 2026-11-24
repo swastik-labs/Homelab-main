@@ -537,7 +537,7 @@ def docker():
                  ("beszel", 24e6, 0), ("beszel-agent", 12e6, 0), ("immich_server", 410e6, 0),
                  ("immich_postgres", 120e6, 0), ("immich_redis", 9e6, 0), ("extraction-service", 35e6, 2),
                  ("homelab-dashboard", 18e6, 0), ("mc-2", 1.4e9, 0), ("mc-1", 0, 0), ("mc-server", 0, 0),
-                 ("defender-staging", 0, 40), ("scratch-runner", 0, 0)]
+                 ("defender-staging", 0, 40), ("scratch-runner", 0, 0), ("nice_mcnulty", 0, 0)]
         cs = []
         for n, m, r in names:
             m = int(jitter(m))
@@ -559,6 +559,10 @@ def docker():
             RECENT_EVENTS.append({"ts": time.time(), "action": "die", "name": "defender-staging", "exit": "1"})
         cs[14].update(state="exited", status="Exited (1) 1 hour ago", uptime=None, exit_code=1, summary="exited",
                       labels={"homelab.ignore": "true"})
+        cs[15].update(state="exited", status="Exited (1) 20 seconds ago", uptime=None, exit_code=1, summary="exited",
+                      image="python:3.13-alpine", ran_secs=3)
+        for c in cs[:15]:
+            c.setdefault("labels", {"com.docker.compose.project": "homelab"})
         cs[10]["uptime"] = "3h 12m"
     else:
         cs = []
@@ -574,6 +578,13 @@ def docker():
                 item["restarts"] = info.get("RestartCount")
                 stt = info.get("State") or {}
                 item.update(exit_code=stt.get("ExitCode"), oom=bool(stt.get("OOMKilled")))
+                try:
+                    a, b = stt.get("StartedAt") or "", stt.get("FinishedAt") or ""
+                    if a[:4] > "0001" and b[:4] > "0001":
+                        item["ran_secs"] = (datetime.fromisoformat(b[:19] + "+00:00")
+                                            - datetime.fromisoformat(a[:19] + "+00:00")).total_seconds()
+                except ValueError:
+                    pass
                 hl = stt.get("Health") or {}
                 if hl:
                     item["health"] = hl.get("Status")
@@ -600,7 +611,9 @@ def docker():
         cs.sort(key=lambda x: (x["state"] != "running", x["name"]))
     for c in cs:  # stopped Minecraft worlds (MC Panel) and the manual ignore list are off on purpose
         c["ignored"] = ignored_container(c)  # "label" / "rule" / "mute" / None
-        c["off_ok"] = c["state"] != "running" and (c["world"] or c["name"] in IGNORE_STOPPED or bool(c["ignored"]))
+        c["oneoff"] = is_oneoff(c)
+        c["off_ok"] = c["state"] != "running" and (c["world"] or c["name"] in IGNORE_STOPPED or bool(c["ignored"])
+                                                    or c["oneoff"])
     df = docker_df()
     running = sum(1 for c in cs if c["state"] == "running")
     down = [c["name"] for c in cs if c["state"] != "running" and not c["off_ok"]]
@@ -837,9 +850,10 @@ def problems():
             restarts_recent = (c.get("restarts") or 0) - base
             deaths = [e for e in RECENT_EVENTS if e["name"] == name and e["action"] == "die" and now - e["ts"] < CRASH_WINDOW]
             ooms = [e for e in RECENT_EVENTS if e["name"] == name and e["action"] == "oom" and now - e["ts"] < 600]
-            if c.get("off_ok") or c.get("ignored"):
-                continue  # stopped MC Panel world, IGNORE_STOPPED_CONTAINERS, or ignored/muted from the dashboard
+            if c.get("oneoff") or (c.get("off_ok") and not c.get("ignored")):
+                continue  # one-off `docker run`, stopped MC Panel world or IGNORE_STOPPED_CONTAINERS
             code = last_exit(name, c.get("exit_code"))
+            mark = len(out)
             if ooms or (c["state"] != "running" and c.get("oom")):
                 add(f"oom:{name}", "container", "oom", name, BAD, "urgent", f"{name} ran out of memory",
                     "killed by the kernel (OOM)", "docker", immediate=True, fingerprint=f"oom:{len(ooms)}")
@@ -855,6 +869,9 @@ def problems():
             elif c.get("health") == "unhealthy":
                 add(f"unhealthy:{name}", "container", "unhealthy", name, BAD, "high", f"{name} is unhealthy",
                     (c.get("health_output") or "health check failing")[:160], "docker", fingerprint="unhealthy")
+            for p in out[mark:]:
+                if c.get("ignored"):
+                    p["ignored"] = c["ignored"]  # shown grey on Home, never an incident or alert
     s = health_system()
     s = s if ok(s) else {}
     t = s.get("cpu_temp_c")
@@ -890,7 +907,8 @@ def problems():
         if f:
             add("ssh_failed", "system", "ssh_failed", "SSH", lvl(f, 1, 20), "high" if f >= 20 else "low", "Failed SSH logins",
                 f"{f} in the last 24 h", "security", fingerprint="many" if f >= 20 else "few")
-        # firewall off is a deliberate choice here: shown on the Security tab, never alerted
+        if sec.get("ufw") == "disabled":  # maintenance item: Home banner only, never an incident or alert
+            add("firewall_off", "system", "firewall_off", "ufw", WARN, "low", "Firewall is off", "ufw disabled", "security")
         if sec.get("playit") == "stopped":
             add("playit_down", "system", "playit_down", "playitd", BAD, "high", "playit tunnel is down", "playitd not running", "security")
     tr = tracker()
@@ -908,7 +926,9 @@ def problems():
             add("deploy_failed", "system", "deploy_failed", g.get("last_run_repo") or "deploy", BAD, "high", "Last deploy failed",
                 g.get("last_run_repo") or "", "bots", fingerprint=g.get("last_run_at"))
     order = {BAD: 0, WARN: 1}
-    out = [p for p in out if not muted(p, now)]
+    for p in out:
+        if not p.get("ignored") and muted(p, now):
+            p["ignored"] = "mute"
     return sorted(out, key=lambda p: order.get(p["level"], 2))
 
 
@@ -929,10 +949,36 @@ def important(problems_):
     return [p for p in problems_ if p["priority"] != "low"]
 
 
+def incident_problems():
+    """What the incident monitor sees: important, and not ignored or muted."""
+    return [p for p in important(problems()) if not p.get("ignored")]
+
+
 def attention_items():
-    """Home banner: (level, what, detail, tab). Problems whose incident is ignored stay out of it."""
+    """Home banner: (level, what, detail, tab). Everything stays visible here, including maintenance items
+    (updates, restart needed, firewall); ignored/muted ones are grey (level UNK) with a tag."""
     quiet = {i["key"] for i in STORE.list(status="open", ignored=True)}
-    return [(p["level"], p["title"], p["detail"], p["tab"]) for p in important(problems()) if p["key"] not in quiet]
+    out = []
+    for p in problems():
+        if p.get("ignored") or p["key"] in quiet:
+            why = {"label": "ignored by label", "mute": "muted"}.get(p.get("ignored"), "ignored")
+            out.append((UNK, p["title"], f"{p['detail']} · {why}", p["tab"]))
+        else:
+            out.append((p["level"], p["title"], p["detail"], p["tab"]))
+    return out
+
+
+ONEOFF_NAME = re.compile(r"^[a-z]+_[a-z]+$")  # Docker's random "adjective_surname" names
+
+
+def is_oneoff(c):
+    """A one-off `docker run` / `--rm`: random name, no compose project, stopped after running under 2 min."""
+    if (c.get("labels") or {}).get("com.docker.compose.project"):
+        return False
+    if not ONEOFF_NAME.match(c["name"]) or c["state"] == "running" or c["state"] == "restarting":
+        return False
+    ran = c.get("ran_secs")
+    return ran is not None and ran < 120
 
 
 # ---------------------------------------------------------------- ignore / mute rules
@@ -1293,7 +1339,7 @@ def monitor_loop():
             for c in (docker().get("containers") or []):  # homelab.ignore=true containers: hide their incidents
                 if c.get("ignored") == "label":
                     STORE.mark_ignored(-1, "kind='container' AND target=?", (c["name"],))
-            MONITOR.tick(important(problems()), now)
+            MONITOR.tick(incident_problems(), now)
         except Exception as e:
             print(f"incident monitor failed: {type(e).__name__}: {str(e)[:160]}", flush=True)
         time.sleep(30)

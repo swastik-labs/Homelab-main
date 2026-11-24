@@ -607,7 +607,9 @@ def panel_docker(d):
     mx = max([c.get("mem_bytes") or 0 for c in cs] + [1])
     trs = []
     for c in cs:
-        if c.get("ignored"):
+        if c.get("oneoff"):
+            clv, st = None, "One-off run, finished"
+        elif c.get("ignored"):
             clv, st = None, (c["state"] or "?").capitalize() + " " + ignored_tag(c)
         elif c["state"] == "running":
             clv = "warn" if c.get("restarts") else "ok"
@@ -672,7 +674,7 @@ def panel_security(s):
 
 
 # ------------------------------------------------------------------ Home overview
-EMOJI_LEVEL = {"🔴": "bad", "🟡": "warn", "🟢": "ok"}
+EMOJI_LEVEL = {"🔴": "bad", "🟡": "warn", "🟢": "ok", "⚪": None}
 
 
 def tile(section, title, ic, value, unit="", lv=None, gauge=None, meaning="", extra="", sparkline=""):
@@ -696,9 +698,14 @@ def panel_home(sysd, bat, hist, e, rows, live, t, d, imm, g, attention, ld=None,
     ydays = [r for r in (rows or []) if r["date"] < today]
 
     # ---- banner
+    quiet = [a for a in attention if a[0] == "⚪"]  # ignored / muted: shown grey, not counted
+    attention = [a for a in attention if a[0] != "⚪"]
+    quiet_html = ("" if not quiet else '<div class="issues quiet">' + "".join(
+        f'<a class="issue" href="#{tab}" style="--c:{MUTED}">{esc(what)}: {esc(detail)}</a>' for lv, what, detail, tab in quiet)
+        + "</div>")
     if not attention:
         c, title, sub, ic = OKC, "All good", "Nothing needs your attention right now.", "check-bold"
-        issues = ""
+        issues = quiet_html
     else:
         worst = "bad" if any(a[0] == "🔴" for a in attention) else "warn"
         c = LEVEL_COLOUR[worst]
@@ -707,7 +714,7 @@ def panel_home(sysd, bat, hist, e, rows, live, t, d, imm, g, attention, ld=None,
         sub, ic = "Click one to open its tab.", "alert" if worst == "bad" else "alert-outline"
         issues = '<div class="issues">' + "".join(
             f'<a class="issue" href="#{tab}" style="--c:{LEVEL_COLOUR[EMOJI_LEVEL.get(lv, "warn")]}">'
-            f'{esc(what)}: {esc(detail)}</a>' for lv, what, detail, tab in attention) + "</div>"
+            f'{esc(what)}: {esc(detail)}</a>' for lv, what, detail, tab in attention) + "</div>" + quiet_html
     banner = (f'<div class="banner" style="--c:{c}"><div class="bi">{icon(ic, c, 26)}</div>'
               f'<div><h2>{title}</h2><p>{sub}</p>{issues}</div></div>')
 
