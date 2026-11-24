@@ -1,6 +1,7 @@
 // swastikserver dashboard: hash-routed tabs; each tab is an HTML fragment from /panel/<id>,
 // re-fetched every few seconds and swapped in place (no page reloads, no framework).
-// Extra routes: #incidents?status=open&range=7d, #incident-<id>, #logs-<container>.
+// Extra routes: #incidents?show=open&range=7d (remembered), #incidents/<id> (that incident expanded),
+// #logs-<container> (current logs).
 (() => {
   const MDI = (n) => `https://cdn.jsdelivr.net/npm/@mdi/svg@7.4.47/svg/${n}.svg`;
   const TABS = [
@@ -21,7 +22,7 @@
     { id: "security", name: "Security", icon: "shield-check", accent: "#34d399", every: 30,
       sub: "Login attempts, firewall and the playit tunnel." },
     { id: "incidents", name: "Incidents", icon: "alert-octagon-outline", accent: "#f87171", every: 20,
-      sub: "What broke, when, and why: the logs and details saved at that moment. Kept for 30 days." },
+      sub: "What broke, when, and why" },
     { id: "links", name: "Links", icon: "link-variant", accent: "#94a3b8", every: 0,
       sub: "The other apps running on the server." },
   ];
@@ -51,14 +52,34 @@
     });
   }
 
-  // "#incident-12" -> incidents tab, /panel/incident/12 ; "#incidents?status=open" -> /panel/incidents?status=open
+  // Incident filters live in the hash and are remembered, so "#incidents" reopens the last view.
+  const store = { get(k) { try { return localStorage.getItem(k); } catch (e) { return null; } },
+                  set(k, v) { try { localStorage.setItem(k, v); } catch (e) { /* private mode */ } } };
+  function incFilters(qs) {
+    const p = new URLSearchParams(qs || store.get("incidents.filters") || "");
+    const f = new URLSearchParams({ show: p.get("show") || "all", range: p.get("range") || "7d" });
+    if (qs) store.set("incidents.filters", f.toString());
+    return f.toString();
+  }
+
+  // "#incidents/12" (or the older "#incident-12") -> the list with incident 12 expanded
   function resolve(hash) {
     const [id, qs] = (hash || "home").split("?");
     let m;
-    if ((m = id.match(/^incident-(\d+)$/))) return { tab: byId.incidents, path: `/panel/incident/${m[1]}` };
+    if ((m = id.match(/^incidents?[/-](\d+)$/))) {
+      return { tab: byId.incidents, path: `/panel/incidents?${incFilters(qs)}&open=${m[1]}`, focus: `inc-${m[1]}` };
+    }
     if ((m = id.match(/^logs-([A-Za-z0-9_.-]{1,128})$/))) return { tab: byId.incidents, path: `/panel/logs/${m[1]}` };
     const tab = byId[id] || byId.home;
-    return { tab, path: `/panel/${tab.id}` + (qs && tab.id === "incidents" ? `?${qs}` : "") };
+    if (tab.id === "incidents") return { tab, path: `/panel/incidents?${incFilters(qs)}` };
+    return { tab, path: `/panel/${tab.id}` };
+  }
+
+  function setShowAll(btn, on) {
+    const pre = document.getElementById(btn.dataset.showall);
+    if (!pre) return;
+    pre.classList.toggle("clip", !on);
+    btn.textContent = on ? "Show fewer lines" : `Show all ${btn.dataset.n} lines`;
   }
 
   async function load(first) {
@@ -71,10 +92,16 @@
       if (my !== seq || r0 !== route) return;  // user switched page meanwhile
       // keep opened log sections open and the scroll position of log boxes across refreshes
       const opened = [...view.querySelectorAll("details[data-keep][open]")].map((d) => d.id);
+      const unclipped = [...view.querySelectorAll("pre.logs[id]:not(.clip)")].map((p) => p.id);
       const scrolls = Object.fromEntries([...view.querySelectorAll("pre.logs[id]")].map((p) => [p.id, p.scrollTop]));
       view.innerHTML = html;
       opened.forEach((id) => { const d = document.getElementById(id); if (d) d.open = true; });
+      unclipped.forEach((id) => { const b = view.querySelector(`[data-showall="${id}"]`); if (b) setShowAll(b, true); });
       Object.entries(scrolls).forEach(([id, top]) => { const p = document.getElementById(id); if (p) p.scrollTop = top; });
+      if (first && r0.focus) {  // deep link: bring the incident into view once
+        const el = document.getElementById(r0.focus);
+        if (el) el.scrollIntoView({ block: "start" });
+      }
       fillLinks(view);
       lastOk = Date.now();
       stamp.textContent = `Live · updated ${clock(new Date())}`;
@@ -106,6 +133,11 @@
     if (current.every) timer = setInterval(() => { if (!document.hidden) load(false); }, current.every * 1000);
   }
 
+  document.addEventListener("click", (ev) => {
+    const btn = ev.target.closest("[data-showall]");
+    if (btn) setShowAll(btn, document.getElementById(btn.dataset.showall)?.classList.contains("clip"));
+  });
+
   // Copy buttons (logs). navigator.clipboard needs https or localhost, so fall back to a hidden textarea.
   document.addEventListener("click", async (ev) => {
     const btn = ev.target.closest("[data-copy]");
@@ -123,7 +155,16 @@
       try { done = document.execCommand("copy"); } catch (e) { done = false; }
       ta.remove();
     }
-    btn.textContent = done ? "Copied ✓" : "Select and copy manually";
+    if (!done) {  // last resort: show every line and select it, so Ctrl+C / long-press copy works
+      const more = view.querySelector(`[data-showall="${src.id}"]`);
+      if (more) setShowAll(more, true);
+      const range = document.createRange();
+      range.selectNodeContents(src);
+      const sel = window.getSelection();
+      sel.removeAllRanges();
+      sel.addRange(range);
+    }
+    btn.textContent = done ? "Copied ✓" : "Selected: press Ctrl+C";
     setTimeout(() => { btn.textContent = "Copy"; }, 2000);
   });
 

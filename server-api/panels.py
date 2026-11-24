@@ -859,179 +859,285 @@ INC_ICON = {"crash_loop": "restart-alert", "container_down": "stop-circle-outlin
             "on_battery": "battery-alert", "updates": "package-up", "reboot": "restart", "ssh_failed": "shield-key",
             "firewall_off": "wall-fire", "playit_down": "tunnel", "tracker": "lightning-bolt-circle",
             "runner_offline": "rocket-launch-outline", "deploy_failed": "rocket-launch-outline"}
-PRIO_TEXT = {"urgent": "Urgent", "high": "High", "low": "Low"}
-PRIO_LEVEL = {"urgent": "bad", "high": "warn", "low": None}
+ERR_HINT = re.compile(r"(?i)\b(errors?|exception|fatal|panic|critical|traceback|failed)\b")
+LOG_WINDOW = (8, 4)  # lines shown before/after the error line until "Show all"
+
+
+def clock_txt(ts):
+    t = datetime.fromtimestamp(ts)
+    return f"{t.hour % 12 or 12}:{t:%M} {'am' if t.hour < 12 else 'pm'}"
 
 
 def inc_when(ts):
     t = datetime.fromtimestamp(ts)
     today = date.today()
     day = "Today" if t.date() == today else "Yesterday" if t.date() == today - timedelta(days=1) else f"{t.day} {t:%b}"
-    return f"{day}, {t.hour % 12 or 12}:{t:%M} {'am' if t.hour < 12 else 'pm'}"
+    return f"{day}, {clock_txt(ts)}"
 
 
 def inc_duration(inc, now=None):
-    end = inc.get("ended") or (now or time.time())
-    secs = int(end - inc["started"])
+    secs = int((inc.get("ended") or (now or time.time())) - inc["started"])
     if secs < 90:
         return f"{secs} s"
     if secs < 5400:
         return f"{secs // 60} min"
     if secs < 172800:
         return f"{secs // 3600} h {secs % 3600 // 60} min"
-    return f"{secs // 86400} days {secs % 86400 // 3600} h"
+    return f"{secs // 86400} d {secs % 86400 // 3600} h"
 
 
-def status_pill(inc):
+def inc_minor(inc):
+    return inc["priority"] == "low" or (inc.get("evidence") or {}).get("minor")
+
+
+def inc_badge(inc):
     if inc["status"] == "open":
-        return pill("bad" if inc["priority"] == "urgent" else "warn" if inc["priority"] == "high" else None, "Open")
-    return pill("ok", "Resolved")
-
-
-def inc_row(inc):
-    open_ = inc["status"] == "open"
-    lv = PRIO_LEVEL.get(inc["priority"]) if open_ else "ok"
-    head = f'<div class="ihead">{esc(inc["headline"])}</div>' if inc.get("headline") else ""
-    return (f'<a class="irow{" open" if open_ else ""}" href="#incident-{inc["id"]}" style="--c:{LEVEL_COLOUR[lv]}">'
-            f'<span class="iic">{icon(INC_ICON.get(inc["type"], "alert-circle-outline"), LEVEL_COLOUR[lv], 22)}</span>'
-            f'<span class="ibody"><span class="ititle"><b>{esc(inc["title"])}</b>{status_pill(inc)}'
-            f'<span class="iprio">{PRIO_TEXT.get(inc["priority"], "")}</span></span>{head}'
-            f'<span class="imeta">{inc_when(inc["started"])} · '
-            f'{"open for " if open_ else "lasted "}{inc_duration(inc)} · {esc(inc["target"] or "")}</span></span></a>')
-
-
-def panel_incidents(items, f, alerts_on, persistent):
-    def chip(group, value, label):
-        q = dict(f, **{group: value})
-        href = "#incidents?" + "&".join(f"{k}={v}" for k, v in q.items())
-        return f'<a class="chip{" on" if f.get(group) == value else ""}" href="{href}">{label}</a>'
-
-    filters = ('<div class="filters">'
-               + '<span class="fl">Show</span>' + chip("status", "all", "All") + chip("status", "open", "Open") + chip("status", "resolved", "Resolved")
-               + '<span class="fl">Type</span>' + chip("type", "all", "All") + chip("type", "container", "Apps")
-               + chip("type", "metric", "Server") + chip("type", "system", "Other")
-               + '<span class="fl">Period</span>' + chip("range", "24h", "24 h") + chip("range", "7d", "7 days") + chip("range", "30d", "30 days")
-               + "</div>")
-    n_open = sum(1 for i in items if i["status"] == "open")
-    lv = "bad" if any(i["status"] == "open" and i["priority"] == "urgent" for i in items) else "warn" if n_open else "ok"
-    summary = card("Right now", "alert-octagon-outline",
-                   big(n_open if n_open else "None", "open" if n_open else "", lv,
-                       f"{len(items)} incident{'s' if len(items) != 1 else ''} in this view" if items else "Nothing in this period"),
-                   lv, "An incident starts when a problem lasts over a minute (crashes and out-of-memory kills count at once) "
-                       "and ends when it's been gone for a minute. The logs and details are saved at that moment.")
-    alerts = card("Phone alerts", "cellphone-message",
-                  big("On" if alerts_on else "Off", "", "ok" if alerts_on else None,
-                      "via your ntfy, topic server-alerts" if alerts_on else "set NTFY_URL and NTFY_TOKEN to turn on"),
-                  "none", "Urgent: an app down, crash-looping or out of memory. High: hot CPU, disk over 85 %, RAM over 90 %. "
-                          "Low (at most once a day): updates waiting, firewall off. Reminders every 3 h while it lasts."
-                  + ("" if persistent else " <b>Incidents are kept in memory only</b> (no /data volume)."), span=2)
-    rows = "".join(inc_row(i) for i in items) or '<p class="empty">No incidents in this period. 🎉</p>'
-    return page("incidents", f'<div class="grid">{summary}{alerts}</div>{filters}<div class="ilist">{rows}</div>'
-                             f'<p class="ex" style="margin-top:14px">Incidents are kept for 30 days.</p>')
-
-
-def log_block(logs, err_idx, key):
-    lines = logs.splitlines()
-    out = []
-    for i, l in enumerate(lines):
-        cls = ' class="errl"' if i == err_idx else (' class="warnl"' if ERR_HINT.search(l) else "")
-        out.append(f"<span{cls}>{esc(l)}</span>")
-    return (f'<div class="logbar"><span>{len(lines)} lines · secrets are hidden</span>'
-            f'<button type="button" class="copy" data-copy="{key}">Copy</button></div>'
-            f'<pre class="logs" id="{key}">' + "".join(out) + "</pre>")  # one block span per line
-
-
-def mini_table(rows, head):
-    return ('<table><thead><tr>' + "".join(f"<th{' class=r' if i else ''}>{h}</th>" for i, h in enumerate(head))
-            + "</tr></thead><tbody>" + "".join("<tr>" + "".join(f"<td{' class=r' if i else ''}>{c}</td>" for i, c in enumerate(r))
-                                               + "</tr>" for r in rows) + "</tbody></table>")
-
-
-def panel_incident(inc, alerts_on):
-    if not inc:
-        return page("incidents", '<p class="empty">This incident no longer exists (kept for 30 days). '
-                                 '<a href="#incidents">Back to incidents</a></p>')
-    ev = inc["evidence"] or {}
-    open_ = inc["status"] == "open"
-    lv = (PRIO_LEVEL.get(inc["priority"]) or "warn") if open_ else "ok"
-    top = (f'<a class="back" href="#incidents">← All incidents</a>'
-           f'<div class="ihero" style="--c:{LEVEL_COLOUR[lv]}">{icon(INC_ICON.get(inc["type"], "alert-circle-outline"), LEVEL_COLOUR[lv], 30)}'
-           f'<div><h2>{esc(inc["title"])} {status_pill(inc)} <span class="iprio">{PRIO_TEXT.get(inc["priority"], "")} priority</span></h2>'
-           f'<p>{inc_when(inc["started"])} · {"open for " if open_ else "lasted "}{inc_duration(inc)}'
-           + (f' · ended {inc_when(inc["ended"])}' if inc.get("ended") else "") + "</p></div></div>")
-    head = (f'<div class="errbox"><span>What went wrong</span><code>{esc(inc["headline"])}</code></div>' if inc.get("headline") else "")
-    cards = [card("Summary", "text-box-outline", f'<div class="sub" style="font-size:14.5px">{esc(inc["summary"] or "")}</div>',
-                  "none", None, span=4)]
-    if inc["kind"] == "container":
-        code = ev.get("exit_code")
-        facts = ('<div class="rows">'
-                 + row("Container", f'{esc(ev.get("container") or inc["target"])}')
-                 + (row("Image", esc(ev["image"])) if ev.get("image") else "")
-                 + row("State when captured", esc(str(ev.get("state") or "—")))
-                 + row("Exit code", f"{code} · {esc(exit_text(code))}" if code is not None else "—",
-                       None if code in (None, 0) else "bad")
-                 + row("Killed for using too much memory", "Yes" if ev.get("oom") else "No", "bad" if ev.get("oom") else None)
-                 + row("Restarts so far", str(ev.get("restarts") if ev.get("restarts") is not None else "—"))
-                 + row("Health check", esc(ev.get("health") or "none"), "bad" if ev.get("health") == "unhealthy" else None)
-                 + "</div>"
-                 + (f'<div class="sub" style="margin-top:8px"><b>Last health check output</b><pre class="logs small">'
-                    f'{esc(ev["health_output"])}</pre></div>' if ev.get("health_output") else "")
-                 + (f'<div class="sub" style="color:{WARNC}">Couldn\'t capture everything: {esc(ev["capture_error"])}</div>'
-                    if ev.get("capture_error") else ""))
-        cards.append(card("Details at the time", "information-outline", facts, "none", None, span=2))
+        c, word = (BADC if inc["priority"] != "low" else WARNC), "OPEN"
     else:
-        parts = []
-        series = ev.get("series") or []
-        if len(series) >= 2:
-            parts.append(line_chart([t for t, _ in series], [(inc["target"], "#f87171", [v for _, v in series])],
-                                    height=170, W=640))
-        if ev.get("top_processes"):
-            parts.append('<div class="sub" style="margin:8px 0 4px"><b>Busiest programs then</b></div>'
-                         + mini_table([(esc(p["name"]), f'{p["cpu"]:.0f}%') for p in ev["top_processes"]], ["Program", "CPU"]))
-        if ev.get("top_containers"):
-            parts.append('<div class="sub" style="margin:10px 0 4px"><b>Biggest apps by memory</b></div>'
-                         + mini_table([(esc(c["name"]), gb(c["mem_bytes"])) for c in ev["top_containers"]], ["App", "Memory"]))
-        if ev.get("docker_disk"):
-            dd = ev["docker_disk"]
-            parts.append('<div class="rows">' + row("Docker images", gb(dd.get("images"))) + row("Docker volumes", gb(dd.get("volumes")))
-                         + row("Build cache", gb(dd.get("build_cache"))) + row("Could be freed", gb(dd.get("reclaimable"))) + "</div>")
-        cards.append(card("Details at the time", "chart-line", "".join(parts) or '<p class="empty">No extra details.</p>',
-                          "none", None, span=2))
-    tl = sorted(ev.get("timeline") or [], key=lambda x: x["ts"])
-    tl_html = '<ol class="timeline">' + "".join(
-        f'<li><span class="tt">{inc_when(t["ts"])}</span><span>{esc(t["text"])}</span></li>' for t in tl) + "</ol>"
-    alert_txt = (f"Phone alert sent {inc_when(inc['last_notified'])}." if inc.get("last_notified")
-                 else "No phone alert was sent" + ("" if alerts_on else " (alerts are off)") + ".")
-    cards.append(card("Timeline", "timeline-clock-outline", tl_html if tl else '<p class="empty">—</p>', "none", alert_txt, span=2))
-    if inc.get("logs"):
-        target = ev.get("container") or inc["target"]
-        block = log_block(inc["logs"], ev.get("error_line"), "log-%d" % inc["id"])
-        n_lines = len(inc["logs"].splitlines())
-        cards.append(card("Logs when it happened", "text-box-search-outline",
-                          f'<details class="logdet" id="det-{inc["id"]}" data-keep><summary>Show the last {n_lines} log lines'
-                          f'</summary>{block}</details>',
-                          "none", f'The error line is highlighted in red. <a href="#logs-{esc(target)}">Open the current logs of {esc(target)}</a>',
-                          span=4))
-    return page("incidents", top + head + f'<div class="grid">{"".join(cards)}</div>')
+        c, word = (WARNC if inc_minor(inc) else OKC), "RESOLVED"
+    return f'<span class="ibadge" style="--c:{c}">{word} · {inc_duration(inc)}</span>'
+
+
+def inc_title(inc):
+    return inc["title"].replace(" is crash-looping", " crash-looping")
+
+
+def inc_oneline(inc):
+    ev = inc.get("evidence") or {}
+    if inc.get("kind") == "system":
+        return ev.get("value") or inc.get("summary") or ""
+    tc = ev.get("top_container_cpu")
+    if tc:
+        return f"Top at the time: {tc['name']} {tc['cpu']:.0f}%" + (f" ({tc['process']})" if tc.get("process") else "")
+    if ev.get("note"):
+        return ev["note"]
+    if inc.get("headline"):
+        return inc["headline"]
+    if ev.get("top_processes"):
+        p = ev["top_processes"][0]
+        return f"Top at the time: {p['name']} {p['cpu']:.0f}%"
+    return inc.get("summary") or ""
+
+
+def exit_short(code):
+    from incidents import exit_meaning
+    return "—" if code is None else f"{code}"
+
+
+def fact(label, value, lv=None, sub=None):
+    colour = f' style="color:{LEVEL_COLOUR[lv]}"' if lv else ""
+    s = f'<small>{esc(sub)}</small>' if sub else ""
+    return f'<div class="fact"><span>{esc(label)}</span><b{colour}>{esc(str(value))}</b>{s}</div>'
+
+
+def inc_facts(inc, alerts_on):
+    ev = inc.get("evidence") or {}
+    if inc.get("last_notified"):
+        alert = fact("Phone alert", f"Sent {clock_txt(inc['last_notified'])}", None,
+                     inc_when(inc["last_notified"]).split(",")[0])
+    elif not alerts_on:
+        alert = fact("Phone alert", "Not configured", None, "set NTFY_URL and NTFY_TOKEN")
+    else:
+        alert = fact("Phone alert", "Not sent", None, "low priority: max once a day" if inc["priority"] == "low" else None)
+    if inc["kind"] == "container":
+        from incidents import exit_meaning
+        code = ev.get("exit_code")
+        rr = ev.get("restarts_recent")
+        restarts = f"{rr} in 15 min" if rr else (ev.get("restarts") if ev.get("restarts") is not None else "—")
+        return ('<div class="facts">'
+                + fact("Exit code", exit_short(code), None if code in (None, 0) else "bad", exit_meaning(code) if code is not None else None)
+                + fact("Restarts", restarts, "bad" if rr else None)
+                + fact("Out of memory", "Yes" if ev.get("oom") else "No", "bad" if ev.get("oom") else None)
+                + alert + "</div>")
+    if inc["kind"] == "system":  # updates, firewall, runner...: no metric facts
+        return ('<div class="facts">'
+                + fact("What", ev.get("value") or inc.get("summary") or "—")
+                + fact("Priority", {"urgent": "Urgent", "high": "High", "low": "Low"}.get(inc["priority"], "—"),
+                       None, "phone alert at most once a day" if inc["priority"] == "low" else None)
+                + fact("Started", clock_txt(inc["started"]), None, inc_when(inc["started"]).split(",")[0])
+                + alert + "</div>")
+    top = inc_oneline(inc) if (ev.get("top_container_cpu") or ev.get("top_processes")) else "—"
+    return ('<div class="facts">'
+            + fact("Peak", ev.get("peak") or ev.get("value") or "—", "bad")
+            + fact("Alert at", ev.get("limit") or "—")
+            + fact("Top at the time", top.replace("Top at the time: ", ""))
+            + alert + "</div>")
+
+
+NOISE = ("exited", "docker restarted", "container stopped", "container started")
+
+
+def inc_timeline(inc):
+    tl = sorted((inc.get("evidence") or {}).get("timeline") or [], key=lambda x: x["ts"])
+    # crash loops repeat "exited → restarted" many times: keep the first and last pair of each run
+    # and summarise the middle, so "detected" / "alert sent" steps always stay visible
+    out, run = [], []
+
+    def flush():
+        if len(run) > 4:
+            middle = run[2:-2]
+            exits = sum(1 for t in middle if "exited" in t["text"].lower() or "stopped" in t["text"].lower())
+            out.extend(run[:2] + [{"ts": None, "text": f"… exited and restarted {exits} more time{'s' if exits != 1 else ''} …"}]
+                       + run[-2:])
+        else:
+            out.extend(run)
+        run.clear()
+
+    for t in tl:
+        if any(n in t["text"].lower() for n in NOISE):
+            run.append(t)
+        else:
+            flush()
+            out.append(t)
+    flush()
+    tl = out
+    items = []
+    for t in tl:
+        when = clock_txt(t["ts"]) if t["ts"] else ""
+        cls = "bad" if any(w in t["text"].lower() for w in ("exited", "stopped", "killed", "detected")) else \
+              "ok" if ("back to normal" in t["text"].lower() or "resolved" in t["text"].lower()) else ""
+        items.append(f'<li class="{cls}"><span class="tt">{when}</span><span>{esc(t["text"])}</span></li>')
+    if inc["status"] == "open":
+        items.append(f'<li class="bad now"><span class="tt">now</span><span>Still failing</span></li>')
+    return f'<ol class="timeline">{"".join(items)}</ol>' if items else ""
+
+
+def inc_logs(inc, title=None, note=None):
+    logs = inc.get("logs") or ""
+    if not logs:
+        return ""
+    lines = logs.splitlines()
+    err = (inc.get("evidence") or {}).get("error_line")
+    if err is None or err >= len(lines):
+        lo, hi = max(0, len(lines) - 12), len(lines) - 1
+    else:
+        lo, hi = max(0, err - LOG_WINDOW[0]), min(len(lines) - 1, err + LOG_WINDOW[1])
+    spans = []
+    for i, l in enumerate(lines):
+        cls = []
+        if i == err:
+            cls.append("errl")
+        elif ERR_HINT.search(l):
+            cls.append("warnl")
+        if i < lo or i > hi:
+            cls.append("far")
+        spans.append(f'<span class="{" ".join(cls)}">{esc(l)}</span>' if cls else f"<span>{esc(l)}</span>")
+    key = f"log-{inc['id']}"
+    more = (f'<button type="button" class="linkbtn" data-showall="{key}" data-n="{len(lines)}">Show all {len(lines)} lines</button>'
+            if len(lines) > hi - lo + 1 else "")
+    title = title or ("Logs at the moment it crashed" if inc["kind"] == "container" and inc["type"] != "container_down"
+                      else "Logs at that moment")
+    note = note or f'<a href="#logs-{esc(inc["target"])}">Open the current logs</a>'
+    return (f'<div class="logsec"><div class="logbar"><b>{esc(title)}</b><span class="lbtns">{more}'
+            f'<button type="button" class="copy" data-copy="{key}">Copy</button></span></div>'
+            f'<pre class="logs clip" id="{key}">{"".join(spans)}</pre>'
+            f'<div class="lognote">Secrets are hidden. {note}</div></div>')
+
+
+def inc_metric_extra(inc):
+    ev = inc.get("evidence") or {}
+    series = ev.get("series") or []
+    out = ""
+    if len(series) >= 2:
+        out += line_chart([t for t, _ in series], [(inc["target"], "#f87171", [v for _, v in series])], height=190, W=1280)
+    if ev.get("top_processes"):
+        out += ('<div class="topgrid">' + "".join(
+            f'<div class="row"><span class="k">{esc(p["name"])}</span><span class="v">{p["cpu"]:.0f}%</span></div>'
+            for p in ev["top_processes"][:5]) + "</div>")
+    if ev.get("docker_disk"):
+        dd = ev["docker_disk"]
+        out += ('<div class="topgrid">' + row("Docker images", gb(dd.get("images"))) + row("Volumes", gb(dd.get("volumes")))
+                + row("Build cache", gb(dd.get("build_cache"))) + row("Could be freed", gb(dd.get("reclaimable"))) + "</div>")
+    return out
+
+
+def inc_card_full(inc, alerts_on):
+    open_ = inc["status"] == "open"
+    c = (BADC if inc["priority"] != "low" else WARNC) if open_ else (WARNC if inc_minor(inc) else OKC)
+    head = f'<div class="errbox"><code>{esc(inc["headline"])}</code></div>' if inc.get("headline") else ""
+    collapse = "" if open_ else '<a class="collapse" href="#incidents">Collapse ▲</a>'
+    body = (head + f'<p class="iexplain">{esc(inc.get("summary") or "")}</p>' + inc_facts(inc, alerts_on)
+            + (inc_metric_extra(inc) if inc["kind"] == "metric" else "")
+            + '<div class="isplit"><div><h4>Timeline</h4>' + inc_timeline(inc) + "</div></div>" + inc_logs(inc))
+    return (f'<article class="icard full{" open" if open_ else ""}" id="inc-{inc["id"]}" style="--c:{c}">'
+            f'<header><div class="ihl">{inc_badge(inc)}<h3>{icon(INC_ICON.get(inc["type"], "alert-circle-outline"), c, 20)}'
+            f'{esc(inc_title(inc))}</h3></div><div class="ihr"><span>{inc_when(inc["started"])}</span>{collapse}</div></header>'
+            f'{body}</article>')
+
+
+def inc_card_compact(inc):
+    c = WARNC if inc_minor(inc) else OKC
+    if inc["status"] == "open":
+        c = BADC if inc["priority"] != "low" else WARNC
+    return (f'<a class="icard compact" id="inc-{inc["id"]}" href="#incidents/{inc["id"]}" style="--c:{c}">'
+            f'<span class="ici">{icon(INC_ICON.get(inc["type"], "alert-circle-outline"), c, 20)}</span>'
+            f'<span class="icm"><span class="ict">{inc_badge(inc)}<b>{esc(inc_title(inc))}</b></span>'
+            f'<span class="icd">{esc(inc_oneline(inc))}</span></span>'
+            f'<span class="icw">{inc_when(inc["started"])}</span></a>')
+
+
+def stat_tile(title, ic, value, sub, lv=None):
+    colour = f' style="color:{LEVEL_COLOUR[lv]}"' if lv else ""
+    return (f'<div class="stat"><div class="th">{icon(ic, LEVEL_COLOUR[lv] if lv else "var(--accent)", 18)}<span>{esc(title)}</span></div>'
+            f'<div class="tv"{colour}>{esc(str(value))}</div><div class="tm">{esc(sub)}</div></div>')
+
+
+def panel_incidents(items, f, stats, full, open_id, alerts_on, persistent):
+    top = stats.get("top")
+    up = stats.get("uptime", 100)
+    down_min = int(stats.get("down_secs", 0) // 60)
+    tiles = ('<div class="stats">'
+             + stat_tile("Open now", "alert-octagon-outline", stats["open"], "needs attention" if stats["open"] else "all clear",
+                         "bad" if stats["open"] else "ok")
+             + stat_tile("Last 7 days", "calendar-week", stats["week"], "incidents")
+             + stat_tile("Most incidents", "podium", top[0] if top else "—", f"{top[1]} in 7 days" if top else "nothing yet")
+             + stat_tile("Uptime (7 d)", "check-decagram-outline", f"{up:.2f}%" if up < 99.995 else "100%",
+                         f"apps down for {down_min} min" if down_min else "no app or server downtime",
+                         "ok" if up >= 99.5 else "warn" if up >= 98 else "bad")
+             + "</div>")
+
+    def pill_(key, value, label):
+        q = dict(f, **{key: value})
+        on = " on" if f.get(key) == value else ""
+        return f'<a class="chip{on}" data-incf href="#incidents?show={q["show"]}&range={q["range"]}">{label}</a>'
+
+    filters = ('<div class="filters"><span class="fgroup">' + pill_("show", "all", "All") + pill_("show", "open", "Open")
+               + pill_("show", "resolved", "Resolved") + pill_("show", "apps", "Apps") + pill_("show", "system", "System")
+               + '</span><span class="fgroup">' + pill_("range", "24h", "24 h") + pill_("range", "7d", "7 d") + pill_("range", "30d", "30 d")
+               + "</span></div>")
+    rank = {"urgent": 0, "high": 1, "low": 2}
+    opened = sorted([i for i in items if i["status"] == "open"], key=lambda i: (rank.get(i["priority"], 3), -i["started"]))
+    rest = sorted([i for i in items if i["status"] != "open"], key=lambda i: -i["started"])
+    cards = []
+    for i in opened + rest:
+        if i["status"] == "open" or i["id"] == open_id:
+            cards.append(inc_card_full(full.get(i["id"]) or i, alerts_on))
+        else:
+            cards.append(inc_card_compact(i))
+    empty = '<div class="ienpty">No incidents here. 🎉 Everything stayed up.</div>'
+    foot = ('<p class="ex" style="margin-top:14px">An incident starts when a problem lasts over a minute (crashes and '
+            'out-of-memory kills at once) and ends after a minute back to normal. Kept for 30 days.'
+            + ("" if persistent else " <b>Kept in memory only</b> (no /data volume).") + "</p>")
+    return page("incidents", tiles + filters + f'<div class="ilist" data-open="{open_id or ""}">{"".join(cards) or empty}</div>' + foot)
 
 
 def panel_logs(name, logs, err_idx, headline):
-    head = (f'<div class="errbox"><span>Latest error</span><code>{esc(headline)}</code></div>' if headline else "")
-    body = card(f"Current logs: {name}", "text-box-search-outline", log_block(logs, err_idx, f"cur-{name}"), "none",
-                "The last 200 lines, refreshed every 30 s. Secrets are hidden.", span=4)
-    return page("incidents", f'<a class="back" href="#incidents">← Incidents</a>{head}<div class="grid">{body}</div>')
-
-
-def exit_text(code):
-    from incidents import exit_meaning
-    return exit_meaning(code)
-
-
-ERR_HINT = re.compile(r"(?i)\b(errors?|exception|fatal|panic|critical|traceback|failed)\b")
+    inc = {"id": f"cur-{name}", "logs": logs, "evidence": {"error_line": err_idx}, "kind": "container", "type": "current",
+           "target": name}
+    head = f'<div class="errbox"><code>{esc(headline)}</code></div>' if headline else ""
+    sec = inc_logs(inc, title=f"Current logs: {name}", note="The last 200 lines, refreshed every 20 s.")
+    return page("incidents", f'<a class="back" href="#incidents">← Incidents</a>{head}'
+                             f'<article class="icard full" style="--c:#94a3b8">{sec}</article>')
 
 
 def recent_incidents_card(recent):
-    if recent is None:
+    if not recent:
         return ""
-    rows = "".join(inc_row(i) for i in recent[:4]) or '<p class="empty">No incidents in the last 7 days. 🎉</p>'
-    return f'<div class="sec">Recent incidents <a class="seclink" href="#incidents">See all →</a></div><div class="ilist compact">{rows}</div>'
+    items, n_open = recent.get("items") or [], recent.get("open") or 0
+    badge = (f'<span class="ibadge" style="--c:{BADC}">{n_open} open</span>' if n_open
+             else f'<span class="ibadge" style="--c:{OKC}">all clear</span>')
+    rank = {"urgent": 0, "high": 1, "low": 2}
+    items = sorted(items, key=lambda i: (i["status"] != "open", rank.get(i["priority"], 3), -i["started"]))
+    rows = "".join(inc_card_compact(i) for i in items[:3]) or '<div class="ienpty small">No incidents in the last 7 days. 🎉</div>'
+    return (f'<div class="sec">Recent incidents {badge}<a class="seclink" href="#incidents">See all →</a></div>'
+            f'<div class="ilist home">{rows}</div>')

@@ -544,6 +544,9 @@ def docker():
         for i, status, code in ((8, "Exited (0) 3 days ago", 0), (11, "Exited (0) 2 days ago", 0), (12, "Exited (143) 5 days ago", 143)):
             cs[i].update(state="exited", status=status, uptime=None, mem_bytes=0, mem="0 B", summary="exited", exit_code=code)
         cs[5].update(health="healthy")
+        cs[0].update(state="restarting", status="Restarting (1) 40 seconds ago", uptime=None, restarts=7, exit_code=1,
+                     mem_bytes=0, mem="0 B", summary="restarting")
+        RESTART_SEEN.setdefault("pvt-discord-bot", deque([(time.time() - 600, 0)], maxlen=50))
         cs[10]["uptime"] = "3h 12m"
     else:
         cs = []
@@ -828,8 +831,9 @@ def problems():
                     "killed by the kernel (OOM)", "docker", immediate=True, fingerprint=f"oom:{len(ooms)}")
             elif c["state"] == "restarting" or len(deaths) >= 3 or restarts_recent >= 3:
                 n = max(len(deaths), restarts_recent)
+                what = f"{n} restarts in 15 min" if n >= 3 else f"restarting, {c.get('restarts') or 0} restarts so far"
                 add(f"crash_loop:{name}", "container", "crash_loop", name, BAD, "urgent", f"{name} is crash-looping",
-                    f"{n} restarts in 15 min" + (f", exit code {code}" if code is not None else ""), "docker",
+                    what + (f", exit code {code}" if code is not None else ""), "docker",
                     immediate=True, fingerprint=f"restarts:{c.get('restarts')}")
             elif c["state"] != "running":
                 add(f"container_down:{name}", "container", "container_down", name, BAD, "urgent", f"{name} is down",
@@ -900,7 +904,30 @@ def attention_items():
 
 
 # ---------------------------------------------------------------- incidents: evidence + monitor
+MOCK_TRACEBACK = [
+    "INFO discord.client logging in using static token",
+    "INFO bot Loading cogs: music, moderation, error_handler",
+    "Traceback (most recent call last):",
+    '  File "/app/bot.py", line 58, in setup_hook',
+    '    await self.load_extension("cogs.error_handler")',
+    '  File "/usr/local/lib/python3.12/site-packages/discord/ext/commands/bot.py", line 1013, in load_extension',
+    "    await self._load_from_module_spec(spec, name)",
+    '  File "/app/cogs/error_handler.py", line 14, in setup',
+    "    sentry_sdk.init(dsn=SENTRY_DSN, send_default_pii=True, traces_sample_rate=0.2)",
+    '  File "/usr/local/lib/python3.12/site-packages/sentry_sdk/client.py", line 112, in _get_options',
+    "    raise TypeError(\"Unknown option '%s'\" % key)",
+    "TypeError: Unknown option 'send_default_pii'",
+    "ERROR bot Fatal error during startup, exiting with code 1"]
+
+
 def mock_logs(name, kind):
+    stamp = lambda t: time.strftime("%Y-%m-%dT%H:%M:%S.000Z ", time.gmtime(t))
+    if name == "pvt-discord-bot":
+        t0 = time.time() - 25 * 60
+        lines = [stamp(t0) + "DEBUG config token=MTIzNDU2Nzg5MDEyMzQ1Njc4OQ.GhIjKl.abcdefghijklmnopqrstuvwxyz0123456789AB"]
+        for i in range(7):
+            lines += [stamp(t0 + i * 200 + 2) + l for l in MOCK_TRACEBACK]
+        return "\n".join(lines)
     if name == "mc-server":
         return "\n".join([
             "2026-11-19T08:01:12.120Z [init] Running as uid=1000 gid=1000",
@@ -944,6 +971,9 @@ def capture_container(p):
     logs = incidents.redact(logs)
     idx, headline = incidents.find_error(logs.splitlines())
     ev["error_line"] = idx
+    m = re.match(r"(\d+) restarts in 15 min", p.get("detail") or "")
+    if p["type"] == "crash_loop" and m:
+        ev["restarts_recent"] = int(m.group(1))
     code = ev.get("exit_code")
     meaning = incidents.exit_meaning(code)
     summary = {
@@ -976,6 +1006,7 @@ def capture_metric(p):
     summary = f"{p['title']}: {p['detail']}" + (f" (alert from {limit})." if limit else ".")
     if p["kind"] == "system":
         summary = f"{p['title']}: {p['detail']}."
+    ev.update(peak=p["detail"], limit=limit)
     return {"summary": summary, "headline": None, "evidence": ev, "logs": ""}
 
 
@@ -988,79 +1019,61 @@ MONITOR = incidents.Monitor(STORE, NTFY, capture)
 
 
 def seed_mock_incidents():
-    """Realistic examples for MOCK mode, including the real send_default_pii crash loop."""
+    """Mock mode: the open send_default_pii crash loop, a resolved CPU-hot, a resolved restart after reboot."""
     if STORE.count():
         return
     now = time.time()
-    tb = [
-        "INFO discord.client logging in using static token",
-        "INFO bot Loading cogs: music, moderation, error_handler",
-        "Traceback (most recent call last):",
-        '  File "/app/bot.py", line 58, in setup_hook',
-        '    await self.load_extension("cogs.error_handler")',
-        '  File "/usr/local/lib/python3.12/site-packages/discord/ext/commands/bot.py", line 1013, in load_extension',
-        "    await self._load_from_module_spec(spec, name)",
-        '  File "/app/cogs/error_handler.py", line 14, in setup',
-        "    sentry_sdk.init(dsn=SENTRY_DSN, send_default_pii=True, traces_sample_rate=0.2)",
-        '  File "/usr/local/lib/python3.12/site-packages/sentry_sdk/client.py", line 112, in _get_options',
-        "    raise TypeError(\"Unknown option '%s'\" % key)",
-        "TypeError: Unknown option 'send_default_pii'",
-        "ERROR bot Fatal error during startup, exiting with code 1"]
-    lines = []
-    t = now - 86400 - 3600
+    # 1. open: pvt-discord-bot crash loop (mock docker() keeps it restarting, so it stays open)
+    start = now - 25 * 60 + 600
+    cap = capture_container({"target": "pvt-discord-bot", "type": "crash_loop", "detail": "7 restarts in 15 min, exit code 1"})
+    tl = []
     for i in range(7):
-        for l in tb:
-            lines.append(time.strftime("%Y-%m-%dT%H:%M:%S.000Z ", time.gmtime(t + i * 380)) + l)
-    lines.insert(1, time.strftime("%Y-%m-%dT%H:%M:%S.000Z ", time.gmtime(t)) +
-                 "DEBUG config token=MTIzNDU2Nzg5MDEyMzQ1Njc4OQ.GhIjKl.abcdefghijklmnopqrstuvwxyz0123456789AB")
-    logs = incidents.redact("\n".join(lines))
-    idx, head = incidents.find_error(logs.splitlines())
-    start = now - 86400 - 3600
-    tl = [{"ts": start, "text": "Problem first noticed: 3 restarts in 15 min, exit code 1"},
-          {"ts": start + 20, "text": "Alert sent to phone"}]
-    tl += [{"ts": start - 760 + i * 380, "text": "Container stopped (exit 1)"} for i in range(7)]
-    tl += [{"ts": start + 1500, "text": "Changed: 7 restarts in 15 min, exit code 1"},
-           {"ts": start + 2760, "text": "Back to normal"}, {"ts": start + 2765, "text": "Resolved message sent to phone"}]
+        tl.append({"ts": now - 25 * 60 + i * 200 + 30, "text": "Exited with code 1"})
+        tl.append({"ts": now - 25 * 60 + i * 200 + 40, "text": "Docker restarted it"})
+    tl += [{"ts": start, "text": "Crash loop detected: 3 restarts in 15 min, exit code 1"},
+           {"ts": start + 2, "text": "Alert sent to phone"}]
+    ev = dict(cap["evidence"], fingerprint="restarts:7", restarts_recent=7, timeline=sorted(tl, key=lambda x: x["ts"]))
     STORE.create({"key": "crash_loop:pvt-discord-bot", "kind": "container", "type": "crash_loop", "target": "pvt-discord-bot",
-                  "severity": BAD, "priority": "urgent", "title": "pvt-discord-bot is crash-looping",
-                  "summary": "pvt-discord-bot keeps crashing and Docker keeps restarting it (7 restarts in 15 min, exit code 1). "
-                             "Exit code 1: the app crashed with an error. The logs point to the line shown above.",
-                  "headline": head, "status": "resolved", "started": start, "ended": start + 2760, "last_notified": start + 20,
-                  "evidence": {"container": "pvt-discord-bot", "image": "pvt-discord-bot:latest", "state": "restarting",
-                               "exit_code": 1, "oom": False, "restarts": 7, "health": None, "error_line": idx,
-                               "timeline": sorted(tl, key=lambda x: x["ts"])},
-                  "logs": logs})
-    ser = [(now - 3 * 86400 - 3600 + i * 120, round(62 + i * 0.9 + random.uniform(-1, 1), 1)) for i in range(31)]
-    STORE.create({"key": "cpu_hot", "kind": "metric", "type": "cpu_hot", "target": "CPU temperature", "severity": BAD,
-                  "priority": "high", "title": "Processor is hot", "summary": "Processor is hot: 91 °C (alert from 80 °C).",
-                  "headline": None, "status": "resolved", "started": now - 3 * 86400 - 3600 + 1800,
-                  "ended": now - 3 * 86400 - 3600 + 1800 + 2520, "last_notified": now - 3 * 86400,
-                  "evidence": {"metric": "cpu_hot", "value": "91 °C", "series": ser,
-                               "top_processes": [{"name": "java", "cpu": 184.0}, {"name": "immich", "cpu": 61.5},
-                                                 {"name": "ffmpeg", "cpu": 48.2}, {"name": "python3", "cpu": 3.1},
-                                                 {"name": "dockerd", "cpu": 1.2}],
-                               "top_containers": [{"name": "mc-2", "mem_bytes": 1.9e9}, {"name": "immich_server", "mem_bytes": 6.1e8},
-                                                  {"name": "immich_postgres", "mem_bytes": 1.3e8}],
-                               "timeline": [{"ts": now - 3 * 86400 - 1800, "text": "Problem first noticed: 84 °C"},
-                                            {"ts": now - 3 * 86400 - 1740, "text": "Alert sent to phone"},
-                                            {"ts": now - 3 * 86400 + 720, "text": "Back to normal"}]}})
-    STORE.create({"key": "disk_high", "kind": "metric", "type": "disk_high", "target": "Disk", "severity": WARN, "priority": "high",
-                  "title": "Disk almost full", "summary": "Disk almost full: 87 % used (alert from 85 %).", "headline": None,
-                  "status": "resolved", "started": now - 12 * 86400, "ended": now - 12 * 86400 + 5400,
-                  "evidence": {"metric": "disk_high", "value": "87 % used", "series": [],
-                               "docker_disk": {"images": 14.2e9, "volumes": 3.1e9, "build_cache": 6.8e9, "reclaimable": 9.4e9},
-                               "timeline": [{"ts": now - 12 * 86400, "text": "Problem first noticed: 87 % used"},
-                                            {"ts": now - 12 * 86400 + 5400, "text": "Back to normal"}]}})
-    started = now - 5 * 86400 + 3600
-    cap = capture_container({"target": "mc-server", "type": "container_down", "detail": "Exited (143) 5 days ago"})
-    ev = dict(cap["evidence"], fingerprint="exit:143",
-              timeline=[{"ts": started - 2, "text": "Container stopped (exit 143)"},
-                        {"ts": started, "text": "Problem first noticed: Exited (143) 5 days ago"},
-                        {"ts": started + 60, "text": "Alert sent to phone"}])
-    STORE.create({"key": "container_down:mc-server", "kind": "container", "type": "container_down", "target": "mc-server",
-                  "severity": BAD, "priority": "urgent", "title": "mc-server is down", "summary": cap["summary"],
-                  "headline": cap["headline"], "status": "open", "started": started, "last_notified": started + 60,
+                  "severity": BAD, "priority": "urgent", "title": "pvt-discord-bot is crash-looping", "summary": cap["summary"],
+                  "headline": cap["headline"], "status": "open", "started": start, "last_notified": start + 2,
                   "evidence": ev, "logs": cap["logs"]})
+    # 2. resolved: processor hot during an Immich video job
+    t0 = now - 2 * 86400 - 5 * 3600
+    ser = [(t0 - 1800 + i * 120, round(66 + i * 0.95 + random.uniform(-1, 1), 1)) for i in range(31)]
+    STORE.create({"key": "cpu_hot", "kind": "metric", "type": "cpu_hot", "target": "CPU temperature", "severity": BAD,
+                  "priority": "high", "title": "Processor is hot",
+                  "summary": "Processor reached 91 °C (alert from 80 °C) while Immich was converting videos.",
+                  "headline": None, "status": "resolved", "started": t0, "ended": t0 + 18 * 60, "last_notified": t0 + 60,
+                  "evidence": {"metric": "cpu_hot", "value": "91 °C", "peak": "91 °C", "limit": "80 °C", "series": ser,
+                               "top_container_cpu": {"name": "immich_server", "cpu": 332, "process": "ffmpeg"},
+                               "top_processes": [{"name": "ffmpeg", "cpu": 332.0}, {"name": "java", "cpu": 41.5},
+                                                 {"name": "immich", "cpu": 22.0}, {"name": "python3", "cpu": 3.1},
+                                                 {"name": "dockerd", "cpu": 1.2}],
+                               "top_containers": [{"name": "immich_server", "mem_bytes": 1.1e9}, {"name": "mc-2", "mem_bytes": 1.4e9}],
+                               "timeline": [{"ts": t0, "text": "Problem detected: 84 °C"},
+                                            {"ts": t0 + 60, "text": "Alert sent to phone"},
+                                            {"ts": t0 + 18 * 60, "text": "Back to normal"},
+                                            {"ts": t0 + 18 * 60 + 5, "text": "Resolved message sent to phone"}]}})
+    # 3. resolved, minor: restarted after the server rebooted
+    t1 = now - 4 * 86400 - 2 * 3600
+    STORE.create({"key": "container_down:immich_server", "kind": "container", "type": "container_down", "target": "immich_server",
+                  "severity": WARN, "priority": "low", "title": "immich_server restarted",
+                  "summary": "Restarted after server reboot. No errors in logs.", "headline": None, "status": "resolved",
+                  "started": t1, "ended": t1 + 140,
+                  "evidence": {"container": "immich_server", "image": "ghcr.io/immich-app/immich-server:v2.3.1", "state": "exited",
+                               "exit_code": 0, "oom": False, "restarts": 0, "minor": True, "note": "Restarted after server reboot. No errors in logs.",
+                               "timeline": [{"ts": t1 - 5, "text": "Server rebooted (kernel update)"},
+                                            {"ts": t1, "text": "Down detected: Exited (0)"},
+                                            {"ts": t1 + 140, "text": "Back to normal"}]},
+                  "logs": "2026-11-20T03:12:01.000Z [Nest] LOG Shutting down\n2026-11-20T03:14:20.000Z [Nest] LOG Immich Server is listening"})
+    # 4. older, outside the default 7 days: disk almost full
+    STORE.create({"key": "disk_high", "kind": "metric", "type": "disk_high", "target": "Disk", "severity": WARN, "priority": "high",
+                  "title": "Disk almost full", "summary": "Disk reached 87 % used (alert from 85 %).", "headline": None,
+                  "status": "resolved", "started": now - 12 * 86400, "ended": now - 12 * 86400 + 5400,
+                  "evidence": {"metric": "disk_high", "value": "87 % used", "limit": "85 %", "series": [],
+                               "docker_disk": {"images": 14.2e9, "volumes": 3.1e9, "build_cache": 6.8e9, "reclaimable": 9.4e9},
+                               "timeline": [{"ts": now - 12 * 86400, "text": "Problem detected: 87 % used"},
+                                            {"ts": now - 12 * 86400 + 5400, "text": "Back to normal"}]}})
 
 
 def monitor_loop():
@@ -1087,15 +1100,55 @@ def monitor_loop():
         time.sleep(30)
 
 
+DOWN_TYPES = ("container_down", "crash_loop", "oom")
+
+
+def incident_stats(now=None):
+    """Stat row: open now, last 7 days, most incidents, uptime (7 d) from app/server-down incidents."""
+    now = now or time.time()
+    week = now - 7 * 86400
+    items = STORE.list(since=week, limit=1000)
+    in_week = [i for i in items if i["started"] >= week or i["status"] == "open"]
+    counts = {}
+    for i in in_week:
+        counts[i["target"]] = counts.get(i["target"], 0) + 1
+    top = max(counts.items(), key=lambda kv: kv[1]) if counts else None
+    spans = sorted((max(i["started"], week), i["ended"] or now) for i in in_week
+                   if i["type"] in DOWN_TYPES and not (i.get("evidence") or {}).get("minor"))
+    down, cur_s, cur_e = 0, None, None
+    for a, b in spans:  # union of overlapping down periods
+        if cur_e is None or a > cur_e:
+            if cur_e is not None:
+                down += cur_e - cur_s
+            cur_s, cur_e = a, b
+        else:
+            cur_e = max(cur_e, b)
+    if cur_e is not None:
+        down += cur_e - cur_s
+    return {"open": sum(1 for i in in_week if i["status"] == "open"), "week": len(in_week),
+            "top": top, "uptime": 100 * (1 - down / (7 * 86400)), "down_secs": down}
+
+
 def incident_list_page(query):
     q = urllib.parse.parse_qs(query)
-    status = (q.get("status") or ["all"])[0]
-    kind = (q.get("type") or ["all"])[0]
+    show = (q.get("show") or ["all"])[0]
     rng = (q.get("range") or ["7d"])[0]
+    try:
+        open_id = int((q.get("open") or ["0"])[0])
+    except ValueError:
+        open_id = 0
     secs = {"24h": 86400, "7d": 7 * 86400, "30d": 30 * 86400}.get(rng, 7 * 86400)
-    items = STORE.list(since=time.time() - secs, status=status if status in ("open", "resolved") else None,
-                       kind=kind if kind in ("container", "metric", "system") else None)
-    return panels.panel_incidents(items, {"status": status, "type": kind, "range": rng}, NTFY.enabled, STORE.persistent)
+    items = STORE.list(since=time.time() - secs, status=show if show in ("open", "resolved") else None,
+                       kind="container" if show == "apps" else None)
+    if show == "system":
+        items = [i for i in items if i["kind"] in ("metric", "system")]
+    if open_id and not any(i["id"] == open_id for i in items):  # a deep link always shows its incident
+        extra = STORE.get(open_id)
+        if extra:
+            items.append(extra)
+    full = {i["id"]: STORE.get(i["id"]) for i in items if i["status"] == "open" or i["id"] == open_id}
+    return panels.panel_incidents(items, {"show": show, "range": rng}, incident_stats(), full, open_id,
+                                  NTFY.enabled, STORE.persistent)
 
 
 def container_logs_page(name):
@@ -1184,8 +1237,8 @@ class Handler(BaseHTTPRequestHandler):
             elif path == "/panel/incidents":
                 body, ctype = incident_list_page(self.path.partition("?")[2]).encode(), "text/html; charset=utf-8"
             elif re.fullmatch(r"/panel/incident/\d+", path):
-                inc = STORE.get(int(path.rsplit("/", 1)[1]))
-                body, ctype = panels.panel_incident(inc, NTFY.enabled).encode(), "text/html; charset=utf-8"
+                body = incident_list_page(f"open={path.rsplit('/', 1)[1]}").encode()
+                ctype = "text/html; charset=utf-8"
             elif re.fullmatch(r"/panel/logs/[A-Za-z0-9_.-]{1,128}", path):
                 body, ctype = container_logs_page(path.rsplit("/", 1)[1]).encode(), "text/html; charset=utf-8"
             elif path == "/incidents":
@@ -1258,7 +1311,8 @@ PANEL_RENDERERS = {
     "security": lambda: panels.panel_security(security()),
     "home": lambda: panels.panel_home(health_system(), health_battery(), history(), energy(), *_rows_with_live(),
                                       traffic(), docker(), immich(), github(), attention_items(), links_data(),
-                                      STORE.list(since=time.time() - 7 * 86400, limit=5)),
+                                      {"items": STORE.list(since=time.time() - 7 * 86400, limit=20),
+                                       "open": len(STORE.list(status="open"))}),
     "links": lambda: panels.panel_links(links_data()),
 }
 

@@ -16,6 +16,8 @@ KEEP_DAYS = 30
 LOG_CAP = 200 * 1024        # bytes of logs kept per incident
 DEBOUNCE = 60               # a problem must last this long before it becomes an incident (crash loops/OOM: at once)
 RESOLVE_AFTER = 60          # ...and must be gone this long before the incident is resolved
+DETECTED = {"crash_loop": "Crash loop detected", "container_down": "Down detected", "oom": "Out-of-memory kill detected",
+            "unhealthy": "Failing health check detected"}
 REMIND = {"urgent": 3 * 3600, "high": 3 * 3600, "low": 24 * 3600}
 NTFY_PRIORITY = {"urgent": 5, "high": 4, "low": 2}
 NTFY_TAGS = {"urgent": ["rotating_light"], "high": ["warning"], "low": ["information_source"]}
@@ -186,7 +188,7 @@ class Store:
 
     def list(self, since=0, status=None, kind=None, limit=300):
         q, args = "SELECT id, key, kind, type, target, severity, priority, title, summary, headline, status, started," \
-                  " ended, last_notified FROM incidents WHERE (started >= ? OR status='open')", [since]
+                  " ended, last_notified, evidence FROM incidents WHERE (started >= ? OR status='open')", [since]
         if status in ("open", "resolved"):
             q += " AND status=?"
             args.append(status)
@@ -196,7 +198,7 @@ class Store:
         q += " ORDER BY (status='open') DESC, started DESC LIMIT ?"
         args.append(limit)
         with self.lock:
-            return [dict(r) for r in self.db.execute(q, args).fetchall()]
+            return [self._row(r) for r in self.db.execute(q, args).fetchall()]  # with evidence, without logs
 
     def count(self):
         with self.lock:
@@ -240,7 +242,7 @@ class Notifier:
         body = {"topic": self.topic, "title": title[:250], "message": message[:3500],
                 "priority": NTFY_PRIORITY.get(priority, priority if isinstance(priority, int) else 3), "tags": tags}
         if incident_id and self.public_url:
-            body["click"] = f"{self.public_url}/#incident-{incident_id}"
+            body["click"] = f"{self.public_url}/#incidents/{incident_id}"
         req = urllib.request.Request(self.url + "/", data=json.dumps(body).encode(), method="POST",
                                      headers={"Content-Type": "application/json",
                                               "Authorization": f"Bearer {self.token}"})
@@ -334,7 +336,7 @@ class Monitor:
             self.pending.pop(key, None)
             cap = self.capture(p)
             ev = dict(cap.get("evidence") or {}, fingerprint=p.get("fingerprint"))
-            self._timeline(ev, first, f"Problem first noticed: {p.get('detail') or p['title']}")
+            self._timeline(ev, first, f"{DETECTED.get(p['type'], 'Problem detected')}: {p.get('detail') or p['title']}")
             for t in cap.get("events") or []:
                 self._timeline(ev, t["ts"], t["text"])
             ev["timeline"].sort(key=lambda x: x["ts"])

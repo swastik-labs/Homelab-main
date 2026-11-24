@@ -26,7 +26,7 @@ yesterday or last month.
 | **Bots and automation** | pvt-discord-bot and mc-discord-bot (running, uptime, memory, restarts), the energy tracker service, the GitHub runner and the latest deploy, and the Minecraft worlds created in MC Panel. |
 | **Docker** | Every container with state, uptime, memory and restart count. Docker disk use (images, volumes, build cache) and how much `docker system prune` could free. |
 | **Security** | Failed SSH logins in the last 24 h, firewall (ufw) on/off, playit tunnel running. |
-| **Incidents** | Every problem that lasted, with what went wrong (the error line from the logs), exit code, out-of-memory kills, restarts, health checks, a timeline and the logs saved at that moment. Filters for open/resolved, type and 24 h / 7 days / 30 days. Home shows the most recent ones. |
+| **Incidents** | What broke, when, and why. Stat row (open now, last 7 days, the app with most incidents, 7-day uptime). Open incidents are pinned at the top as full cards: the error line from the logs, a plain-English explanation, exit code, restarts, out-of-memory and phone-alert facts, a timeline, and the logs around the error (Copy, Show all). Resolved ones are one-line cards that expand on click. Filters: All / Open / Resolved / Apps / System and 24 h / 7 d / 30 d, remembered. `#incidents/<id>` opens one incident; phone alerts link there. Home shows the 3 most recent. |
 | **Links** | Found automatically from Docker and grouped (Apps, Minecraft, Monitoring, Projects, External), with a running/stopped dot and a NEW badge for apps first seen in the last 24 h. Minecraft worlds appear as status tiles. Home shows the same apps as quick-link buttons. |
 
 Pages refresh themselves every 15 to 30 seconds without reloading, and the header shows when
@@ -135,7 +135,7 @@ private ntfy. When it has been gone for 60 s, the incident is resolved and you g
 | **Low** | updates waiting, restart needed, firewall off, a few failed SSH logins, energy tracker stuck. At most one phone alert per problem per day. |
 
 - One message per problem, a reminder every 3 h while it lasts (low priority: once a day),
-  and tapping the alert opens the incident on the dashboard.
+  and tapping the alert opens the incident on the dashboard (`/#incidents/<id>`).
 - Stopped MC Panel worlds and `IGNORE_STOPPED_CONTAINERS` never alert.
 - **Evidence for apps:** exit code and what it means, out-of-memory kill, restart count,
   health status and the last health-check output, Docker events (die/restart/oom), and the
