@@ -4,4 +4,5 @@ services:
     pid: !reset null
     environment:
       MOCK: "1"
-    volumes: !reset []
+    volumes: !override
+      - dashboard-data:/data

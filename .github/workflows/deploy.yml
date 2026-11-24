@@ -19,11 +19,15 @@ jobs:
         env:
           IMMICH_API_KEY: ${{ secrets.IMMICH_API_KEY }}
           DASH_GITHUB_TOKEN: ${{ secrets.DASH_GITHUB_TOKEN }}
+          NTFY_URL: ${{ secrets.NTFY_URL }}
+          NTFY_TOKEN: ${{ secrets.NTFY_TOKEN }}
         run: |
           umask 077
           {
             printf 'IMMICH_API_KEY=%s\n' "$IMMICH_API_KEY"
             printf 'DASH_GITHUB_TOKEN=%s\n' "$DASH_GITHUB_TOKEN"
+            printf 'NTFY_URL=%s\n' "$NTFY_URL"
+            printf 'NTFY_TOKEN=%s\n' "$NTFY_TOKEN"
           } > .env
 
       - name: Deploy

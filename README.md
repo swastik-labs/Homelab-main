@@ -26,6 +26,7 @@ yesterday or last month.
 | **Bots and automation** | pvt-discord-bot and mc-discord-bot (running, uptime, memory, restarts), the energy tracker service, the GitHub runner and the latest deploy, and the Minecraft worlds created in MC Panel. |
 | **Docker** | Every container with state, uptime, memory and restart count. Docker disk use (images, volumes, build cache) and how much `docker system prune` could free. |
 | **Security** | Failed SSH logins in the last 24 h, firewall (ufw) on/off, playit tunnel running. |
+| **Incidents** | Every problem that lasted, with what went wrong (the error line from the logs), exit code, out-of-memory kills, restarts, health checks, a timeline and the logs saved at that moment. Filters for open/resolved, type and 24 h / 7 days / 30 days. Home shows the most recent ones. |
 | **Links** | Found automatically from Docker and grouped (Apps, Minecraft, Monitoring, Projects, External), with a running/stopped dot and a NEW badge for apps first seen in the last 24 h. Minecraft worlds appear as status tiles. Home shows the same apps as quick-link buttons. |
 
 Pages refresh themselves every 15 to 30 seconds without reloading, and the header shows when
@@ -54,11 +55,13 @@ browser ──► :3000  homelab-dashboard container (Python)
                          /var/run/docker.sock ... containers, memory, disk usage, app links
                          Immich API ............. photo counts, storage, queue
                          GitHub API ............. org runner status, latest workflow run
+                    ├─ writes only to /data (volume dashboard-data): incidents.db
+                    └─ sends phone alerts to your ntfy (optional)
 ```
 
-- Everything is **read-only**: the container has a read-only filesystem, all Linux
-  capabilities dropped except `DAC_READ_SEARCH` (needed to read `auth.log`), and
-  `no-new-privileges`.
+- Everything is **read-only** except the `dashboard-data` volume at `/data`, where incidents
+  are kept: the container has a read-only filesystem, all Linux capabilities dropped except
+  `DAC_READ_SEARCH` (needed to read `auth.log`), and `no-new-privileges`.
 - Every source is cached for 10 to 60 seconds. Missing files show as "Unknown" and never
   crash the page.
 - CPU/memory/temperature history is kept in memory for 24 hours, so that chart starts
@@ -117,6 +120,36 @@ started fresh on 14 Nov 2026, so there is no older home-network data mixed in. U
 first full day is recorded, the daily charts, month pace and bill estimate say
 "Collecting data, the first full day appears tomorrow".
 
+## Phone alerts (ntfy) and incidents
+
+The same check that drives Home's "N things need attention" banner runs every 30 s. When a
+problem lasts **60 s** (crash loops and out-of-memory kills count at once), it becomes an
+**incident**: the dashboard saves the evidence right then and sends a phone alert through your
+private ntfy. When it has been gone for 60 s, the incident is resolved and you get
+"✅ resolved after X min".
+
+| Priority | Problems |
+|---|---|
+| **Urgent** | an app/bot is down, crash-looping (3+ restarts in 15 min) or killed for running out of memory |
+| **High** | app unhealthy, CPU ≥ 80 °C, SSD ≥ 65 °C, RAM ≥ 90 %, disk ≥ 85 %, running on battery, playit down, energy tracker stopped, runner offline, deploy failed, 20+ failed SSH logins |
+| **Low** | updates waiting, restart needed, firewall off, a few failed SSH logins, energy tracker stuck. At most one phone alert per problem per day. |
+
+- One message per problem, a reminder every 3 h while it lasts (low priority: once a day),
+  and tapping the alert opens the incident on the dashboard.
+- Stopped MC Panel worlds and `IGNORE_STOPPED_CONTAINERS` never alert.
+- **Evidence for apps:** exit code and what it means, out-of-memory kill, restart count,
+  health status and the last health-check output, Docker events (die/restart/oom), and the
+  last 150 log lines. The line that explains the failure (the final exception of a Python
+  traceback, or the last error line) becomes the incident's headline, for example
+  `TypeError: Unknown option 'send_default_pii'`.
+- **Evidence for server problems:** the value over the last hour and the busiest programs and
+  apps at that moment.
+- **Secrets are hidden** before anything is stored or shown: Discord tokens and webhooks,
+  `tk_…` ntfy tokens, `Bearer …`, GitHub tokens, `password=…`, API keys and passwords in URLs.
+- Incidents are stored in SQLite on the `dashboard-data` volume, so they survive redeploys.
+  Logs are capped at 200 KB per incident and resolved incidents are deleted after 30 days.
+- Alerts are **off** until `NTFY_URL` and `NTFY_TOKEN` are set. The token is never logged.
+
 ## Repository layout
 
 ```
@@ -127,6 +160,7 @@ server-api/
   app.py                    # data collection, caching, HTTP server
   panels.py                 # renders each tab (HTML + inline SVG charts)
   links.py                  # finds app links from Docker; known-app catalog
+  incidents.py              # incidents (SQLite), evidence, secret redaction, ntfy alerts
   web/                      # index.html, app.css, app.js, favicon.svg
 .github/workflows/deploy.yml
 .env.example
@@ -134,7 +168,9 @@ server-api/
 
 ## Try it on Windows with mock data
 
-Needs Docker Desktop. Mock mode uses realistic fake data and mounts nothing from the host.
+Needs Docker Desktop. Mock mode uses realistic fake data (including example incidents such
+as the `send_default_pii` crash loop) and mounts nothing from the host except its own
+`dashboard-data` volume.
 
 ```bash
 docker compose -f docker-compose.yml -f docker-compose.mock.yml up -d --build --remove-orphans
@@ -166,6 +202,8 @@ Add them under **Settings → Secrets and variables → Actions**.
 |---|---|---|
 | `IMMICH_API_KEY` | Immich API key, created by an **admin** user in Immich → Account settings → API keys | `server.statistics`, `server.storage`, and `job.read` (`queue.read` on newer Immich versions). |
 | `DASH_GITHUB_TOKEN` | Fine-grained personal access token, **resource owner: swastik-labs** | Organization: **Self-hosted runners: Read-only**. Repository access: all repositories, with **Actions: Read-only** and **Metadata: Read-only**. |
+| `NTFY_URL` | Your ntfy server as the dashboard container reaches it, e.g. `http://192.168.31.125:8085` | — |
+| `NTFY_TOKEN` | ntfy access token (`tk_…`) for a user that may **publish** to `server-alerts` | write access to the `server-alerts` topic only |
 
 If a secret is missing, its cards say "not set" and the rest of the dashboard still works.
 For a manual run on the server, copy `.env.example` to `.env` and fill it in. `.env` is
