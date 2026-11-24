@@ -21,6 +21,7 @@ jobs:
           DASH_GITHUB_TOKEN: ${{ secrets.DASH_GITHUB_TOKEN }}
           NTFY_URL: ${{ secrets.NTFY_URL }}
           NTFY_TOKEN: ${{ secrets.NTFY_TOKEN }}
+          DASHBOARD_ADMIN_PIN: ${{ secrets.DASHBOARD_ADMIN_PIN }}
         run: |
           umask 077
           {
@@ -28,6 +29,7 @@ jobs:
             printf 'DASH_GITHUB_TOKEN=%s\n' "$DASH_GITHUB_TOKEN"
             printf 'NTFY_URL=%s\n' "$NTFY_URL"
             printf 'NTFY_TOKEN=%s\n' "$NTFY_TOKEN"
+            printf 'DASHBOARD_ADMIN_PIN=%s\n' "$DASHBOARD_ADMIN_PIN"
           } > .env
 
       - name: Deploy

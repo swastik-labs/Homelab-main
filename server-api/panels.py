@@ -7,6 +7,8 @@ import calendar
 import html
 import re
 import time
+
+from incidents import is_error_line
 from datetime import date, datetime, timedelta
 
 OKC, WARNC, BADC, MUTED = "#4ade80", "#fbbf24", "#f87171", "#94a3b8"
@@ -542,6 +544,9 @@ def panel_immich(i):
 def container_card(c, title, ic, what):
     if not c:
         return card(title, ic, big("Not found", "", "bad"), "bad", what)
+    if c.get("ignored"):
+        word = "Running" if c["state"] == "running" else c["state"].capitalize()
+        return card(title, ic, big(word, "", None, f'{esc(c.get("status") or "")} {ignored_tag(c)}'), None, what)
     if c["state"] != "running":
         return card(title, ic, big("Stopped", "", "bad", esc(c.get("status") or "")), "bad", what)
     lv = "warn" if c.get("restarts") else "ok"
@@ -602,7 +607,9 @@ def panel_docker(d):
     mx = max([c.get("mem_bytes") or 0 for c in cs] + [1])
     trs = []
     for c in cs:
-        if c["state"] == "running":
+        if c.get("ignored"):
+            clv, st = None, (c["state"] or "?").capitalize() + " " + ignored_tag(c)
+        elif c["state"] == "running":
             clv = "warn" if c.get("restarts") else "ok"
             st = "Running" + (" (world)" if c.get("world") else "")
         elif c.get("world"):
@@ -859,7 +866,65 @@ INC_ICON = {"crash_loop": "restart-alert", "container_down": "stop-circle-outlin
             "on_battery": "battery-alert", "updates": "package-up", "reboot": "restart", "ssh_failed": "shield-key",
             "firewall_off": "wall-fire", "playit_down": "tunnel", "tracker": "lightning-bolt-circle",
             "runner_offline": "rocket-launch-outline", "deploy_failed": "rocket-launch-outline"}
-ERR_HINT = re.compile(r"(?i)\b(errors?|exception|fatal|panic|critical|traceback|failed)\b")
+def ignored_tag(c):
+    why = {"label": "by Docker label", "mute": "muted", "rule": "ignored"}.get(c.get("ignored"), "ignored")
+    return f'<span class="igtag" title="No incidents or alerts for this container">{"muted" if why == "muted" else "ignored"}</span>'
+
+
+MUTES = [(1, "1 h"), (8, "8 h"), (24, "24 h"), (168, "7 d")]
+
+
+def inc_menu(inc, admin):
+    """'Ignore…' menu. off: no PIN configured (read-only), locked: ask for the PIN, on: the actions."""
+    if admin == "off":
+        return ""
+    iid = inc["id"]
+    if inc.get("ignored"):
+        rid = inc["ignored"]
+        if rid < 0:
+            return '<span class="igtag">ignored by Docker label</span>'
+        btn = (f'<button type="button" class="mbtn" data-unrule="{rid}">Un-ignore</button>' if admin == "on"
+               else '<span class="igtag">ignored</span>')
+        return f'<span class="imenu-inline"><span class="igtag">ignored</span>{btn}</span>'
+    if admin == "locked":
+        inner = ('<form class="pinform" data-pin><label>PIN required</label>'
+                 '<input type="password" inputmode="numeric" autocomplete="current-password" name="pin" placeholder="Admin PIN" required>'
+                 '<button type="submit" class="mbtn">Unlock</button><span class="pinmsg" aria-live="polite"></span></form>')
+    else:
+        opts = []
+        if inc["kind"] == "container":
+            opts.append(f'<button type="button" data-rule="container" data-incident="{iid}"><b>Ignore this container</b>'
+                        f'<small>No incidents, alerts or Home items for {esc(inc["target"])}</small></button>')
+        if inc.get("headline"):
+            opts.append(f'<button type="button" data-rule="error" data-incident="{iid}"><b>Ignore this error everywhere</b>'
+                        f'<small>Any incident with this error line</small></button>')
+        opts.append('<div class="mutes"><span>Mute for</span>' + "".join(
+            f'<button type="button" data-rule="mute" data-hours="{h}" data-incident="{iid}">{t}</button>' for h, t in MUTES) + "</div>")
+        inner = "".join(opts)
+    return (f'<details class="imenu" id="menu-{iid}"><summary>Ignore…</summary><div class="mpop">{inner}</div></details>')
+
+
+def rules_section(rules, label_ignored, admin):
+    n = len(rules) + len(label_ignored)
+    rows_ = []
+    for r in rules:
+        until = ""
+        if r.get("until"):
+            left = max(0, int(r["until"] - time.time()))
+            until = f' · ends in {left // 3600} h {left % 3600 // 60} min' if left >= 3600 else f' · ends in {left // 60} min'
+        btn = (f'<button type="button" class="mbtn" data-unrule="{r["id"]}">Un-ignore</button>' if admin == "on"
+               else '<span class="igtag">PIN required</span>' if admin == "locked" else "")
+        rows_.append(f'<div class="rrow"><span><b>{esc(r["label"] or r["value"])}</b>'
+                     f'<small>{ {"container": "container", "error": "error line", "mute": "mute"}.get(r["kind"], r["kind"])}'
+                     f' · since {inc_when(r["created"])}{until}</small></span>{btn}</div>')
+    for name in label_ignored:
+        rows_.append(f'<div class="rrow"><span><b>Ignore container {esc(name)}</b><small>set by the Docker label '
+                     f'<code>homelab.ignore: "true"</code>; remove the label to undo</small></span></div>')
+    body = "".join(rows_) or '<p class="empty">Nothing is ignored or muted.</p>'
+    hint = ("" if admin != "off" else '<p class="ex">Read-only: set DASHBOARD_ADMIN_PIN to manage ignores from here. '
+            'You can still ignore a container with the Docker label <code>homelab.ignore: "true"</code>.</p>')
+    return (f'<details class="manage" id="manage-ignored" data-keep><summary>Manage ignored ({n})</summary>'
+            f'<div class="rlist">{body}</div>{hint}</details>')
 LOG_WINDOW = (8, 4)  # lines shown before/after the error line until "Show all"
 
 
@@ -943,9 +1008,16 @@ def inc_facts(inc, alerts_on):
         from incidents import exit_meaning
         code = ev.get("exit_code")
         rr = ev.get("restarts_recent")
+        code_note = None
+        if ev.get("exit_code") is not None:
+            code_note = exit_meaning(ev["exit_code"])
+            if inc["type"] == "crash_loop" and ev["exit_code"] == 0:
+                code_note = "exits by itself, then Docker restarts it"
+            if ev.get("state_exit_code") is not None:
+                code_note = f"last stop · Docker's state says {ev['state_exit_code']}"
         restarts = f"{rr} in 15 min" if rr else (ev.get("restarts") if ev.get("restarts") is not None else "—")
         return ('<div class="facts">'
-                + fact("Exit code", exit_short(code), None if code in (None, 0) else "bad", exit_meaning(code) if code is not None else None)
+                + fact("Exit code", exit_short(code), None if code in (None, 0) else "bad", code_note)
                 + fact("Restarts", restarts, "bad" if rr else None)
                 + fact("Out of memory", "Yes" if ev.get("oom") else "No", "bad" if ev.get("oom") else None)
                 + alert + "</div>")
@@ -1017,7 +1089,7 @@ def inc_logs(inc, title=None, note=None):
         cls = []
         if i == err:
             cls.append("errl")
-        elif ERR_HINT.search(l):
+        elif is_error_line(l):
             cls.append("warnl")
         if i < lo or i > hi:
             cls.append("far")
@@ -1051,29 +1123,44 @@ def inc_metric_extra(inc):
     return out
 
 
-def inc_card_full(inc, alerts_on):
+def inc_card_full(inc, alerts_on, admin="off"):
     open_ = inc["status"] == "open"
     c = (BADC if inc["priority"] != "low" else WARNC) if open_ else (WARNC if inc_minor(inc) else OKC)
-    head = f'<div class="errbox"><code>{esc(inc["headline"])}</code></div>' if inc.get("headline") else ""
+    if inc.get("ignored"):
+        c = MUTED
+    code = (inc.get("evidence") or {}).get("exit_code")
+    if inc.get("headline"):
+        head = f'<div class="errbox"><code>{esc(inc["headline"])}</code></div>'
+    elif inc["kind"] == "container" and inc.get("logs"):
+        head = ('<div class="errbox none"><code>No error found in the logs'
+                + (f"; it exited with code {code}" if code is not None else "") + "</code></div>")
+    else:
+        head = ""
     collapse = "" if open_ else '<a class="collapse" href="#incidents">Collapse ▲</a>'
     body = (head + f'<p class="iexplain">{esc(inc.get("summary") or "")}</p>' + inc_facts(inc, alerts_on)
             + (inc_metric_extra(inc) if inc["kind"] == "metric" else "")
             + '<div class="isplit"><div><h4>Timeline</h4>' + inc_timeline(inc) + "</div></div>" + inc_logs(inc))
     return (f'<article class="icard full{" open" if open_ else ""}" id="inc-{inc["id"]}" style="--c:{c}">'
             f'<header><div class="ihl">{inc_badge(inc)}<h3>{icon(INC_ICON.get(inc["type"], "alert-circle-outline"), c, 20)}'
-            f'{esc(inc_title(inc))}</h3></div><div class="ihr"><span>{inc_when(inc["started"])}</span>{collapse}</div></header>'
+            f'{esc(inc_title(inc))}</h3></div><div class="ihr"><span>{inc_when(inc["started"])}</span>{collapse}'
+            f'{inc_menu(inc, admin)}</div></header>'
             f'{body}</article>')
 
 
-def inc_card_compact(inc):
+def inc_card_compact(inc, admin="off"):
     c = WARNC if inc_minor(inc) else OKC
     if inc["status"] == "open":
         c = BADC if inc["priority"] != "low" else WARNC
-    return (f'<a class="icard compact" id="inc-{inc["id"]}" href="#incidents/{inc["id"]}" style="--c:{c}">'
+    if inc.get("ignored"):
+        c = MUTED
+    menu = inc_menu(inc, admin)
+    return (f'<div class="icard compact" id="inc-{inc["id"]}" style="--c:{c}">'
+            f'<a class="icl" href="#incidents/{inc["id"]}">'
             f'<span class="ici">{icon(INC_ICON.get(inc["type"], "alert-circle-outline"), c, 20)}</span>'
             f'<span class="icm"><span class="ict">{inc_badge(inc)}<b>{esc(inc_title(inc))}</b></span>'
             f'<span class="icd">{esc(inc_oneline(inc))}</span></span>'
-            f'<span class="icw">{inc_when(inc["started"])}</span></a>')
+            f'<span class="icw">{inc_when(inc["started"])}</span></a>'
+            + (f'<span class="icmenu">{menu}</span>' if menu else "") + "</div>")
 
 
 def stat_tile(title, ic, value, sub, lv=None):
@@ -1082,7 +1169,7 @@ def stat_tile(title, ic, value, sub, lv=None):
             f'<div class="tv"{colour}>{esc(str(value))}</div><div class="tm">{esc(sub)}</div></div>')
 
 
-def panel_incidents(items, f, stats, full, open_id, alerts_on, persistent):
+def panel_incidents(items, f, stats, full, open_id, alerts_on, persistent, admin="off", rules=(), label_ignored=()):
     top = stats.get("top")
     up = stats.get("uptime", 100)
     down_min = int(stats.get("down_secs", 0) // 60)
@@ -1103,18 +1190,21 @@ def panel_incidents(items, f, stats, full, open_id, alerts_on, persistent):
 
     filters = ('<div class="filters"><span class="fgroup">' + pill_("show", "all", "All") + pill_("show", "open", "Open")
                + pill_("show", "resolved", "Resolved") + pill_("show", "apps", "Apps") + pill_("show", "system", "System")
+               + pill_("show", "ignored", "Ignored")
                + '</span><span class="fgroup">' + pill_("range", "24h", "24 h") + pill_("range", "7d", "7 d") + pill_("range", "30d", "30 d")
                + "</span></div>")
+    filters += rules_section(list(rules), list(label_ignored), admin)
     rank = {"urgent": 0, "high": 1, "low": 2}
     opened = sorted([i for i in items if i["status"] == "open"], key=lambda i: (rank.get(i["priority"], 3), -i["started"]))
     rest = sorted([i for i in items if i["status"] != "open"], key=lambda i: -i["started"])
     cards = []
     for i in opened + rest:
-        if i["status"] == "open" or i["id"] == open_id:
-            cards.append(inc_card_full(full.get(i["id"]) or i, alerts_on))
+        if i["id"] == open_id or (i["status"] == "open" and not i.get("ignored")):
+            cards.append(inc_card_full(full.get(i["id"]) or i, alerts_on, admin))
         else:
-            cards.append(inc_card_compact(i))
-    empty = '<div class="ienpty">No incidents here. 🎉 Everything stayed up.</div>'
+            cards.append(inc_card_compact(i, admin))
+    empty = ('<div class="ienpty">Nothing ignored.</div>' if f.get("show") == "ignored"
+             else '<div class="ienpty">No incidents here. 🎉 Everything stayed up.</div>')
     foot = ('<p class="ex" style="margin-top:14px">An incident starts when a problem lasts over a minute (crashes and '
             'out-of-memory kills at once) and ends after a minute back to normal. Kept for 30 days.'
             + ("" if persistent else " <b>Kept in memory only</b> (no /data volume).") + "</p>")

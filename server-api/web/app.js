@@ -130,12 +130,60 @@
     }
     clearInterval(timer);
     load(true);
-    if (current.every) timer = setInterval(() => { if (!document.hidden) load(false); }, current.every * 1000);
+    if (current.every) timer = setInterval(() => { if (!document.hidden && !busy()) load(false); }, current.every * 1000);
   }
 
   document.addEventListener("click", (ev) => {
     const btn = ev.target.closest("[data-showall]");
     if (btn) setShowAll(btn, document.getElementById(btn.dataset.showall)?.classList.contains("clip"));
+  });
+
+  // ---- Ignore / mute (write actions; the server checks the PIN cookie and this custom header)
+  async function api(path, body) {
+    const r = await fetch(path, { method: "POST", credentials: "same-origin",
+      headers: { "Content-Type": "application/json", "X-Dashboard": "1" }, body: JSON.stringify(body || {}) });
+    let data = {};
+    try { data = await r.json(); } catch (e) { /* empty */ }
+    if (!r.ok) throw new Error(data.error || `HTTP ${r.status}`);
+    return data;
+  }
+  const busy = () => !!view.querySelector("details.imenu[open]") ||
+    (document.activeElement && view.contains(document.activeElement) && document.activeElement.tagName === "INPUT");
+
+  document.addEventListener("click", async (ev) => {
+    const add = ev.target.closest("[data-rule]");
+    const del = ev.target.closest("[data-unrule]");
+    if (!add && !del) return;
+    ev.preventDefault();
+    const b = add || del;
+    b.disabled = true;
+    try {
+      if (add) await api("/api/rules", { incident: +add.dataset.incident, kind: add.dataset.rule, hours: add.dataset.hours ? +add.dataset.hours : null });
+      else await api("/api/rules/delete", { rule: +del.dataset.unrule });
+      view.querySelectorAll("details.imenu[open]").forEach((d) => { d.open = false; });
+      load(false);
+    } catch (e) {
+      b.disabled = false;
+      alert(e.message === "PIN required" ? "Your PIN session expired. Open the menu again to unlock." : `Couldn't do that: ${e.message}`);
+      load(false);
+    }
+  });
+
+  document.addEventListener("submit", async (ev) => {
+    const form = ev.target.closest("form[data-pin]");
+    if (!form) return;
+    ev.preventDefault();
+    const msg = form.querySelector(".pinmsg");
+    const input = form.querySelector("input[name=pin]");
+    try {
+      await api("/api/login", { pin: input.value });
+      input.value = "";
+      input.blur();
+      load(false);  // the menus now show the actions (remembered for 30 days)
+    } catch (e) {
+      msg.textContent = e.message;
+      input.select();
+    }
   });
 
   // Copy buttons (logs). navigator.clipboard needs https or localhost, so fall back to a hidden textarea.

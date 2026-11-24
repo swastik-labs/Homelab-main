@@ -47,8 +47,33 @@ def redact(text):
 # ------------------------------------------------------------------ logs
 _TS = re.compile(r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d+)?Z\s?")
 _EXC = re.compile(r"^(?:[A-Za-z_][\w.]*\.)?[A-Za-z_]\w*(?:Error|Exception|Exit|Interrupt|Fault|Failure)\b(?::.*)?$")
-_ERRWORD = re.compile(r"(?i)\b(errors?|exception|fatal|panic|critical|traceback|failed)\b")
-_NOT_ERR = re.compile(r"(?i)\b(0|no) errors?\b|error_handler|errors?=0")
+# a real log level, not just the word "error" somewhere in an info line
+_LEVEL = re.compile(r"\b(?:ERROR|CRITICAL|FATAL|PANIC|EMERG|SEVERE)\b"
+                    r"|(?i:\blevel[=:]\s*\"?(?:error|critical|fatal|panic)\b)"
+                    r"|(?i:\[(?:error|crit|critical|fatal|panic|emerg)\])"
+                    r"|(?i:^\s*(?:error|fatal|critical|panic)\s*[:|\]])")
+_FATAL = re.compile(r"(?i)segmentation fault|core dumped|out of memory|oom[- ]?kill|no space left on device"
+                    r"|address already in use|unhandled (?:promise )?rejection|uncaught exception|^panic:"
+                    r"|cannot find module|exited with code [1-9]|permission denied")
+_BENIGN = re.compile(r"✅|✔|☑|\b(?:INFO|DEBUG|TRACE|NOTICE)\b|(?i:\benabled\b|\bsuccess(?:ful(?:ly)?)?\b|\b(?:0|no) errors?\b)")
+
+
+def is_error_line(line):
+    """True for lines that look like a real failure (used for highlighting and the headline)."""
+    l = strip_ts(line).strip()
+    if not l or _BENIGN.search(l):
+        return False
+    return bool(_EXC.match(l) or _LEVEL.search(l) or _FATAL.search(l))
+
+
+def normalize_error(line):
+    """Make an error line comparable across repeats: no timestamps, ids, hex or numbers."""
+    s = strip_ts(line or "").strip().lower()
+    s = re.sub(r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b", "<id>", s)
+    s = re.sub(r"\d{4}-\d\d-\d\d[t ]\d\d:\d\d(?::\d\d(?:\.\d+)?)?z?", "<time>", s)
+    s = re.sub(r"\b0x[0-9a-f]+\b|\b(?=[0-9a-f]*\d)[0-9a-f]{8,}\b", "<hex>", s)
+    s = re.sub(r"\d+(?:\.\d+)?", "<n>", s)
+    return re.sub(r"\s+", " ", s)[:300]
 
 
 def strip_ts(line):
@@ -70,8 +95,10 @@ def demux_docker_logs(raw):
 def find_error(lines):
     """-> (index, text) of the line that best explains the failure, or (None, None).
 
-    Prefers the final exception of the last Python traceback, then the last line that
-    mentions error/exception/fatal/panic."""
+    In order: the final exception of the last Python traceback, a bare "XxxError: ..." line,
+    the last line at ERROR/CRITICAL/FATAL level, the last known fatal pattern. Info lines
+    (✅, INFO, "enabled", "success") never count, so "Sentry Error Tracking: ENABLED" is ignored.
+    Nothing real found -> (None, None); the page then says so instead of inventing a headline."""
     plain = [strip_ts(l).rstrip() for l in lines]
     tb = max((i for i, l in enumerate(plain) if "Traceback (most recent call last)" in l), default=None)
     if tb is not None:
@@ -79,13 +106,11 @@ def find_error(lines):
             l = plain[i]
             if l and not l.startswith((" ", "\t")) and _EXC.match(l):
                 return i, l.strip()
-    for i in range(len(plain) - 1, -1, -1):  # a bare "SomethingError: ..." line
-        if _EXC.match(plain[i].strip()):
-            return i, plain[i].strip()[:300]
-    for i in range(len(plain) - 1, -1, -1):
-        l = plain[i]
-        if _ERRWORD.search(l) and not _NOT_ERR.search(l):
-            return i, l.strip()[:300]
+    for test in (lambda l: _EXC.match(l), lambda l: _LEVEL.search(l), lambda l: _FATAL.search(l)):
+        for i in range(len(plain) - 1, -1, -1):
+            l = plain[i].strip()
+            if l and not _BENIGN.search(l) and test(l):
+                return i, l[:300]
     return None, None
 
 
@@ -140,7 +165,13 @@ class Store:
                 CREATE INDEX IF NOT EXISTS inc_status ON incidents(status, key);
                 CREATE INDEX IF NOT EXISTS inc_started ON incidents(started);
                 CREATE TABLE IF NOT EXISTS kv (k TEXT PRIMARY KEY, v TEXT);
+                CREATE TABLE IF NOT EXISTS rules (
+                  id INTEGER PRIMARY KEY, kind TEXT NOT NULL, value TEXT NOT NULL, label TEXT,
+                  created REAL, until REAL);
             """)
+            cols = {r[1] for r in self.db.execute("PRAGMA table_info(incidents)").fetchall()}
+            if "ignored" not in cols:  # older databases: add the column in place
+                self.db.execute("ALTER TABLE incidents ADD COLUMN ignored INTEGER NOT NULL DEFAULT 0")
             self.db.commit()
 
     def _row(self, r):
@@ -186,9 +217,10 @@ class Store:
             return self._row(self.db.execute(
                 "SELECT * FROM incidents WHERE status='open' AND key=? ORDER BY id DESC LIMIT 1", (key,)).fetchone())
 
-    def list(self, since=0, status=None, kind=None, limit=300):
+    def list(self, since=0, status=None, kind=None, limit=300, ignored=False):
         q, args = "SELECT id, key, kind, type, target, severity, priority, title, summary, headline, status, started," \
-                  " ended, last_notified, evidence FROM incidents WHERE (started >= ? OR status='open')", [since]
+                  " ended, last_notified, evidence, ignored FROM incidents WHERE (started >= ? OR status='open')", [since]
+        q += " AND ignored != 0" if ignored else " AND ignored = 0"
         if status in ("open", "resolved"):
             q += " AND status=?"
             args.append(status)
@@ -203,6 +235,55 @@ class Store:
     def count(self):
         with self.lock:
             return self.db.execute("SELECT COUNT(*) FROM incidents").fetchone()[0]
+
+    # ---- ignore / mute rules
+    def add_rule(self, kind, value, label, until=None, now=None):
+        now = now or time.time()
+        with self.lock:
+            old = self.db.execute("SELECT id FROM rules WHERE kind=? AND value=?", (kind, value)).fetchone()
+            if old:  # same rule again: just refresh its expiry
+                self.db.execute("UPDATE rules SET until=?, label=?, created=? WHERE id=?", (until, label, now, old[0]))
+                rid = old[0]
+            else:
+                rid = self.db.execute("INSERT INTO rules (kind, value, label, created, until) VALUES (?,?,?,?,?)",
+                                      (kind, value, label, now, until)).lastrowid
+            self.db.commit()
+        return rid
+
+    def rules(self, now=None):
+        now = now or time.time()
+        with self.lock:
+            return [dict(r) for r in self.db.execute(
+                "SELECT * FROM rules WHERE until IS NULL OR until > ? ORDER BY created DESC", (now,)).fetchall()]
+
+    def delete_rule(self, rid):
+        """Un-ignore: drop the rule and show its incidents again."""
+        with self.lock:
+            n = self.db.execute("DELETE FROM rules WHERE id=?", (rid,)).rowcount
+            self.db.execute("UPDATE incidents SET ignored=0 WHERE ignored=?", (rid,))
+            self.db.commit()
+        return n
+
+    def expire_rules(self, now=None):
+        """Finished mutes: remove them and show their incidents again."""
+        now = now or time.time()
+        with self.lock:
+            ids = [r[0] for r in self.db.execute("SELECT id FROM rules WHERE until IS NOT NULL AND until <= ?", (now,))]
+            for rid in ids:
+                self.db.execute("DELETE FROM rules WHERE id=?", (rid,))
+                self.db.execute("UPDATE incidents SET ignored=0 WHERE ignored=?", (rid,))
+            self.db.commit()
+        return ids
+
+    def mark_ignored(self, rid, where, args=()):
+        with self.lock:
+            n = self.db.execute(f"UPDATE incidents SET ignored=? WHERE ignored=0 AND ({where})", (rid, *args)).rowcount
+            self.db.commit()
+        return n
+
+    def headlines(self):
+        with self.lock:
+            return [(r[0], r[1]) for r in self.db.execute("SELECT id, headline FROM incidents WHERE headline IS NOT NULL AND ignored=0")]
 
     def delete_low(self):
         with self.lock:
@@ -284,8 +365,9 @@ class Monitor:
     capture(problem) -> {"summary", "headline", "evidence": {...}, "logs": str}
     """
 
-    def __init__(self, store, notifier, capture):
+    def __init__(self, store, notifier, capture, error_rule=None):
         self.store, self.notifier, self.capture = store, notifier, capture
+        self.error_rule = error_rule or (lambda headline: 0)  # -> rule id that ignores this error line, or 0
         self.pending = {}   # key -> first time seen (debounce)
         self.absent = {}    # key -> first time missing (resolve debounce)
         self.last_prune = 0
@@ -330,6 +412,11 @@ class Monitor:
                                   summary=cap.get("summary") or inc["summary"], headline=cap.get("headline") or inc["headline"])
                     ev = ev2
                 interval = REMIND.get(p["priority"], 3 * 3600)
+                if not inc.get("ignored") and fields.get("headline") and self.error_rule(fields["headline"]):
+                    fields["ignored"] = self.error_rule(fields["headline"])  # its new error line is ignored
+                if inc.get("ignored") or fields.get("ignored"):
+                    self.store.update(inc["id"], **fields)  # ignored/muted: keep it up to date, never notify
+                    continue
                 if self.notifier.enabled and inc["last_notified"] and now - inc["last_notified"] >= interval:
                     if self._notify_open(inc["id"], p, {"headline": inc["headline"]}, now, reminder=True, opened=inc["started"]):
                         fields["last_notified"] = now
@@ -347,11 +434,15 @@ class Monitor:
             for t in cap.get("events") or []:
                 self._timeline(ev, t["ts"], t["text"])
             ev["timeline"].sort(key=lambda x: x["ts"])
+            ignored_by = self.error_rule(cap.get("headline")) if cap.get("headline") else 0
             iid = self.store.create({"key": key, "kind": p["kind"], "type": p["type"], "target": p["target"],
                                      "severity": p["level"], "priority": p["priority"], "title": p["title"],
                                      "summary": cap.get("summary") or p.get("detail") or "", "headline": cap.get("headline"),
                                      "started": first, "last_seen": now, "last_capture": now, "evidence": ev,
                                      "logs": cap.get("logs") or ""})
+            if ignored_by:  # "Ignore this error everywhere": recorded, hidden, never alerted
+                self.store.update(iid, ignored=ignored_by)
+                continue
             if self._notify_open(iid, p, cap, now):
                 self._timeline(ev, now, "Alert sent to phone")
                 self.store.update(iid, last_notified=now, evidence=ev)
@@ -368,7 +459,7 @@ class Monitor:
             self.absent.pop(inc["key"], None)
             ev = self._timeline(inc["evidence"], gone, "Back to normal")
             dur = fmt_duration(gone - inc["started"])
-            if inc["last_notified"] and self.notifier.enabled:
+            if inc["last_notified"] and self.notifier.enabled and not inc.get("ignored"):
                 if self.notifier.send(f"Resolved: {inc['title']}", f"✅ resolved after {dur}", 3, ["white_check_mark"], inc["id"]):
                     self._timeline(ev, now, "Resolved message sent to phone")
             self.store.update(inc["id"], status="resolved", ended=gone, evidence=ev)

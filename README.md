@@ -150,6 +150,34 @@ private ntfy. When it has been gone for 60 s, the incident is resolved and you g
 - Incidents are stored in SQLite on the `dashboard-data` volume, so they survive redeploys.
   Logs are capped at 200 KB per incident and resolved incidents are deleted after 30 days.
 - Alerts are **off** until `NTFY_URL` and `NTFY_TOKEN` are set. The token is never logged.
+- The headline is only a real failure: the final exception of a Python traceback, a line at
+  ERROR/CRITICAL/FATAL level, or a known fatal pattern. Info lines like
+  `✅ Sentry Error Tracking: ENABLED` never count; if nothing real is found the card says
+  "No error found in the logs; it exited with code N". The exit code is taken from the
+  container's most recent stop, not Docker's current state.
+
+### Ignore and mute
+
+Some containers fail on purpose (e.g. a staging environment that restarts all the time).
+Every incident has an **Ignore…** menu:
+
+- **Ignore this container**: no more incidents, alerts or Home banner items for it. Its old
+  incidents move to the **Ignored** filter. It still shows its real state on the Docker and
+  Bots tabs, but grey with an "ignored" tag, never red.
+- **Ignore this error everywhere**: any incident whose error line matches (numbers, ids, hex
+  and timestamps don't matter).
+- **Mute for 1 h / 8 h / 24 h / 7 days**: the same, but temporary.
+
+**Manage ignored** (under the filters) lists every rule with an **Un-ignore** button. Ignored or
+muted problems never send a phone alert, not even "resolved". Rules are kept in the
+`dashboard-data` volume, so they survive redeploys.
+
+As config instead of clicks, give a container the Docker label `homelab.ignore: "true"`.
+
+The dashboard has no login, so these buttons need the **admin PIN** (`DASHBOARD_ADMIN_PIN`).
+You enter it once per browser and it's remembered for 30 days (a signed, HttpOnly cookie).
+Five wrong tries lock the PIN for 15 minutes, and changing the PIN signs every browser out.
+Without a PIN the dashboard stays read-only and the menus are hidden.
 
 ## Repository layout
 
@@ -205,6 +233,7 @@ Add them under **Settings → Secrets and variables → Actions**.
 | `DASH_GITHUB_TOKEN` | Fine-grained personal access token, **resource owner: swastik-labs** | Organization: **Self-hosted runners: Read-only**. Repository access: all repositories, with **Actions: Read-only** and **Metadata: Read-only**. |
 | `NTFY_URL` | Your ntfy server as the dashboard container reaches it, e.g. `http://192.168.31.125:8085` | — |
 | `NTFY_TOKEN` | ntfy access token (`tk_…`) for a user that may **publish** to `server-alerts` | write access to the `server-alerts` topic only |
+| `DASHBOARD_ADMIN_PIN` | PIN that unlocks Ignore/Mute in the browser. Leave it out to keep the dashboard read-only. | — |
 
 If a secret is missing, its cards say "not set" and the rest of the dashboard still works.
 For a manual run on the server, copy `.env.example` to `.env` and fill it in. `.env` is

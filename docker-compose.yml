@@ -28,6 +28,7 @@ services:
       NTFY_TOKEN: ${NTFY_TOKEN:-}
       NTFY_TOPIC: server-alerts
       DASHBOARD_PUBLIC_URL: http://192.168.31.125:3000   # where a tap on an alert opens
+      DASHBOARD_ADMIN_PIN: ${DASHBOARD_ADMIN_PIN:-}      # unlocks Ignore/Mute; empty = read-only dashboard
     volumes:
       - /:/hostfs:ro,rslave
       - /var/run/docker.sock:/var/run/docker.sock:ro

@@ -1,10 +1,13 @@
 """Read-only JSON API for Homepage customapi widgets. Python stdlib only."""
 import calendar
+import hashlib
+import hmac
 import http.client
 import json
 import os
 import random
 import re
+import secrets
 import socket
 import sqlite3
 import threading
@@ -34,6 +37,7 @@ GH_TOKEN = os.environ.get("DASH_GITHUB_TOKEN", "")
 GH_ORG = os.environ.get("GITHUB_ORG", "swastik-labs")
 GH_RUNNER = os.environ.get("GITHUB_RUNNER", "homelab-laptop")
 DATA_DIR = os.environ.get("DATA_DIR", "/data")
+ADMIN_PIN = (os.environ.get("DASHBOARD_ADMIN_PIN") or "").strip()  # unset: dashboard stays read-only
 NTFY = incidents.Notifier(os.environ.get("NTFY_URL"), os.environ.get("NTFY_TOKEN"),
                           os.environ.get("NTFY_TOPIC") or "server-alerts",
                           os.environ.get("DASHBOARD_PUBLIC_URL") or "http://192.168.31.125:3000")
@@ -532,7 +536,8 @@ def docker():
         names = [("pvt-discord-bot", 62e6, 0), ("mc-discord-bot", 58e6, 1), ("mcpanel", 41e6, 0),
                  ("beszel", 24e6, 0), ("beszel-agent", 12e6, 0), ("immich_server", 410e6, 0),
                  ("immich_postgres", 120e6, 0), ("immich_redis", 9e6, 0), ("extraction-service", 35e6, 2),
-                 ("homelab-dashboard", 18e6, 0), ("mc-2", 1.4e9, 0), ("mc-1", 0, 0), ("mc-server", 0, 0)]
+                 ("homelab-dashboard", 18e6, 0), ("mc-2", 1.4e9, 0), ("mc-1", 0, 0), ("mc-server", 0, 0),
+                 ("defender-staging", 0, 40), ("scratch-runner", 0, 0)]
         cs = []
         for n, m, r in names:
             m = int(jitter(m))
@@ -547,6 +552,13 @@ def docker():
         cs[0].update(state="restarting", status="Restarting (1) 40 seconds ago", uptime=None, restarts=7, exit_code=1,
                      mem_bytes=0, mem="0 B", summary="restarting")
         RESTART_SEEN.setdefault("pvt-discord-bot", deque([(time.time() - 600, 0)], maxlen=50))
+        # defender-staging restarts all the time on purpose; Docker's state shows exit 0, its last stop was exit 1
+        cs[13].update(state="restarting", status="Restarting (1) 12 seconds ago", uptime=None, exit_code=0, summary="restarting")
+        RESTART_SEEN.setdefault("defender-staging", deque([(time.time() - 600, 30)], maxlen=50))
+        if not any(e["name"] == "defender-staging" and time.time() - e["ts"] < 90 for e in RECENT_EVENTS):
+            RECENT_EVENTS.append({"ts": time.time(), "action": "die", "name": "defender-staging", "exit": "1"})
+        cs[14].update(state="exited", status="Exited (1) 1 hour ago", uptime=None, exit_code=1, summary="exited",
+                      labels={"homelab.ignore": "true"})
         cs[10]["uptime"] = "3h 12m"
     else:
         cs = []
@@ -555,6 +567,7 @@ def docker():
             item = {"name": name, "state": c.get("State"), "status": c.get("Status"),
                     "uptime": None, "restarts": None, "mem_bytes": None, "mem": None,
                     "world": (c.get("Labels") or {}).get("mcpanel") == "1", "image": c.get("Image") or "",
+                    "labels": c.get("Labels") or {},
                     "exit_code": None, "oom": False, "health": None, "health_output": None}
             try:
                 info = docker_get(f"/containers/{c['Id']}/json")
@@ -586,7 +599,8 @@ def docker():
             cs.append(item)
         cs.sort(key=lambda x: (x["state"] != "running", x["name"]))
     for c in cs:  # stopped Minecraft worlds (MC Panel) and the manual ignore list are off on purpose
-        c["off_ok"] = c["state"] != "running" and (c["world"] or c["name"] in IGNORE_STOPPED)
+        c["ignored"] = ignored_container(c)  # "label" / "rule" / "mute" / None
+        c["off_ok"] = c["state"] != "running" and (c["world"] or c["name"] in IGNORE_STOPPED or bool(c["ignored"]))
     df = docker_df()
     running = sum(1 for c in cs if c["state"] == "running")
     down = [c["name"] for c in cs if c["state"] != "running" and not c["off_ok"]]
@@ -823,9 +837,9 @@ def problems():
             restarts_recent = (c.get("restarts") or 0) - base
             deaths = [e for e in RECENT_EVENTS if e["name"] == name and e["action"] == "die" and now - e["ts"] < CRASH_WINDOW]
             ooms = [e for e in RECENT_EVENTS if e["name"] == name and e["action"] == "oom" and now - e["ts"] < 600]
-            if c.get("off_ok"):
-                continue  # stopped MC Panel world or IGNORE_STOPPED_CONTAINERS
-            code = c.get("exit_code")
+            if c.get("off_ok") or c.get("ignored"):
+                continue  # stopped MC Panel world, IGNORE_STOPPED_CONTAINERS, or ignored/muted from the dashboard
+            code = last_exit(name, c.get("exit_code"))
             if ooms or (c["state"] != "running" and c.get("oom")):
                 add(f"oom:{name}", "container", "oom", name, BAD, "urgent", f"{name} ran out of memory",
                     "killed by the kernel (OOM)", "docker", immediate=True, fingerprint=f"oom:{len(ooms)}")
@@ -894,7 +908,19 @@ def problems():
             add("deploy_failed", "system", "deploy_failed", g.get("last_run_repo") or "deploy", BAD, "high", "Last deploy failed",
                 g.get("last_run_repo") or "", "bots", fingerprint=g.get("last_run_at"))
     order = {BAD: 0, WARN: 1}
+    out = [p for p in out if not muted(p, now)]
     return sorted(out, key=lambda p: order.get(p["level"], 2))
+
+
+def last_exit(name, fallback=None):
+    """Exit code of the container's most recent stop (Docker's current state can say 0 while it crash-loops)."""
+    for e in reversed(RECENT_EVENTS):
+        if e["name"] == name and e["action"] == "die" and e.get("exit") not in (None, ""):
+            try:
+                return int(e["exit"])
+            except ValueError:
+                break
+    return fallback
 
 
 def important(problems_):
@@ -904,8 +930,151 @@ def important(problems_):
 
 
 def attention_items():
-    """Home banner: (level, what, detail, tab)."""
-    return [(p["level"], p["title"], p["detail"], p["tab"]) for p in important(problems())]
+    """Home banner: (level, what, detail, tab). Problems whose incident is ignored stay out of it."""
+    quiet = {i["key"] for i in STORE.list(status="open", ignored=True)}
+    return [(p["level"], p["title"], p["detail"], p["tab"]) for p in important(problems()) if p["key"] not in quiet]
+
+
+# ---------------------------------------------------------------- ignore / mute rules
+def _rules_now():
+    try:
+        return STORE.rules()
+    except NameError:  # during import, before STORE exists
+        return []
+
+
+def ignored_container(c):
+    """'label' (homelab.ignore=true), 'rule' (Ignore this container), 'mute' (muted for a while) or None."""
+    if str((c.get("labels") or {}).get("homelab.ignore", "")).lower() in ("true", "1", "yes"):
+        return "label"
+    for r in _rules_now():
+        if r["kind"] == "container" and r["value"] == c["name"]:
+            return "rule"
+        if r["kind"] == "mute" and r["value"] == f"container:{c['name']}":
+            return "mute"
+    return None
+
+
+def muted(p, now=None):
+    for r in _rules_now():
+        if r["kind"] == "mute" and r["value"] == f"key:{p['key']}":
+            return True
+        if r["kind"] in ("container", "mute") and p["kind"] == "container" and r["value"] in (p["target"], f"container:{p['target']}"):
+            return True
+    return False
+
+
+def error_rule(headline):
+    """Rule id that ignores this error line everywhere, or 0."""
+    norm = incidents.normalize_error(headline) if headline else None
+    for r in _rules_now():
+        if r["kind"] == "error" and norm and r["value"] == norm:
+            return r["id"]
+    return 0
+
+
+MUTE_HOURS = {1: "1 h", 8: "8 h", 24: "24 h", 168: "7 days"}
+
+
+def add_rule_from_incident(iid, kind, hours=None):
+    """Create an ignore/mute rule from an incident (the server decides what it matches, not the browser)."""
+    inc = STORE.get(iid)
+    if not inc:
+        raise ValueError("incident not found")
+    now = time.time()
+    if kind == "container":
+        if inc["kind"] != "container":
+            raise ValueError("not a container incident")
+        name = inc["target"]
+        rid = STORE.add_rule("container", name, f"Ignore container {name}")
+        STORE.mark_ignored(rid, "kind='container' AND target=?", (name,))
+    elif kind == "error":
+        if not inc.get("headline"):
+            raise ValueError("this incident has no error line")
+        norm = incidents.normalize_error(inc["headline"])
+        rid = STORE.add_rule("error", norm, f"Ignore error: {inc['headline'][:160]}")
+        ids = [i for i, h in STORE.headlines() if incidents.normalize_error(h) == norm]
+        if ids:
+            STORE.mark_ignored(rid, f"id IN ({','.join('?' * len(ids))})", ids)
+    elif kind == "mute":
+        if hours not in MUTE_HOURS:
+            raise ValueError("unsupported mute length")
+        scope = f"container:{inc['target']}" if inc["kind"] == "container" else f"key:{inc['key']}"
+        what = inc["target"] if inc["kind"] == "container" else inc["title"]
+        rid = STORE.add_rule("mute", scope, f"Muted {what} for {MUTE_HOURS[hours]}", until=now + hours * 3600)
+        if inc["kind"] == "container":
+            STORE.mark_ignored(rid, "status='open' AND kind='container' AND target=?", (inc["target"],))
+        else:
+            STORE.mark_ignored(rid, "status='open' AND key=?", (inc["key"],))
+    else:
+        raise ValueError("unknown rule type")
+    _cache.pop("docker", None)
+    return rid
+
+
+# ---------------------------------------------------------------- admin PIN (protects the ignore controls)
+ADMIN_COOKIE = "dash_admin"
+ADMIN_DAYS = 30
+_fails = {}            # client ip -> [failure times]
+_fails_all = deque(maxlen=200)
+_fail_lock = threading.Lock()
+
+
+def _auth_key():
+    k = STORE.kv_get("auth_secret")
+    if not k:
+        k = secrets.token_hex(32)
+        STORE.kv_set("auth_secret", k)
+    # the PIN is part of the key, so changing DASHBOARD_ADMIN_PIN signs everyone out
+    return hmac.new(k.encode(), hashlib.sha256(ADMIN_PIN.encode()).digest(), hashlib.sha256).digest()
+
+
+def issue_token(now=None):
+    exp = int((now or time.time()) + ADMIN_DAYS * 86400)
+    sig = hmac.new(_auth_key(), str(exp).encode(), hashlib.sha256).hexdigest()
+    return f"{exp}.{sig}"
+
+
+def token_ok(token, now=None):
+    if not ADMIN_PIN or not token or "." not in token:
+        return False
+    exp, _, sig = token.partition(".")
+    if not exp.isdigit() or int(exp) < (now or time.time()):
+        return False
+    good = hmac.new(_auth_key(), exp.encode(), hashlib.sha256).hexdigest()
+    return hmac.compare_digest(good, sig)
+
+
+def admin_state(headers):
+    """'off' (no PIN configured), 'locked' or 'on' for this browser."""
+    if not ADMIN_PIN:
+        return "off"
+    for part in (headers.get("Cookie") or "").split(";"):
+        k, _, v = part.strip().partition("=")
+        if k == ADMIN_COOKIE and token_ok(v):
+            return "on"
+    return "locked"
+
+
+def pin_attempt_allowed(ip, now=None):
+    now = now or time.time()
+    with _fail_lock:
+        mine = [t for t in _fails.get(ip, []) if now - t < 900]
+        _fails[ip] = mine
+        recent_all = [t for t in _fails_all if now - t < 900]
+        return len(mine) < 5 and len(recent_all) < 30
+
+
+def pin_failed(ip, now=None):
+    now = now or time.time()
+    with _fail_lock:
+        _fails.setdefault(ip, []).append(now)
+        _fails_all.append(now)
+
+
+def check_pin(pin):
+    return bool(ADMIN_PIN) and hmac.compare_digest(hashlib.sha256(str(pin).encode()).digest(),
+                                                   hashlib.sha256(ADMIN_PIN.encode()).digest())
 
 
 # ---------------------------------------------------------------- incidents: evidence + monitor
@@ -933,6 +1102,14 @@ def mock_logs(name, kind):
         for i in range(7):
             lines += [stamp(t0 + i * 200 + 2) + l for l in MOCK_TRACEBACK]
         return "\n".join(lines)
+    if name == "defender-staging":
+        t0 = time.time() - 300
+        return "\n".join(stamp(t0 + i) + l for i, l in enumerate([
+            "INFO [SYSTEM] Booting defender (staging)",
+            "✅ [SYSTEM] Sentry Error Tracking: ENABLED",
+            "✅ [SYSTEM] Database: connected",
+            "INFO [SYSTEM] Running staging self-test",
+            "INFO [SYSTEM] Self-test finished, restarting staging environment"]))
     if name == "mc-server":
         return "\n".join([
             "2026-11-19T08:01:12.120Z [init] Running as uid=1000 gid=1000",
@@ -966,7 +1143,11 @@ def capture_container(p):
             raw = docker_raw(f"/containers/{urllib.parse.quote(name)}/logs?stdout=1&stderr=1&tail=150&timestamps=1")
             logs = incidents.demux_docker_logs(raw)
             now = time.time()
-            for e in docker_events(now - 3600, now, name)[-40:]:
+            evs = docker_events(now - 3600, now, name)[-40:]
+            dies = [e for e in evs if e["action"] == "die" and e["exit"] not in (None, "")]
+            if dies:
+                RECENT_EVENTS.extend(e for e in dies if e not in RECENT_EVENTS)
+            for e in evs:
                 what = {"die": f"Container stopped (exit {e['exit']})" if e["exit"] is not None else "Container stopped",
                         "oom": "Killed: out of memory", "restart": "Docker restarted it", "start": "Container started",
                         "stop": "Container was stopped", "kill": "Container was killed"}.get(e["action"], e["action"])
@@ -976,11 +1157,17 @@ def capture_container(p):
     logs = incidents.redact(logs)
     idx, headline = incidents.find_error(logs.splitlines())
     ev["error_line"] = idx
+    state_code = ev.get("exit_code")
+    last = last_exit(name, state_code)
+    if last is not None and last != state_code:
+        ev.update(exit_code=last, state_exit_code=state_code)  # "last exit: 1; Docker's current state says 0"
     m = re.match(r"(\d+) restarts in 15 min", p.get("detail") or "")
     if p["type"] == "crash_loop" and m:
         ev["restarts_recent"] = int(m.group(1))
     code = ev.get("exit_code")
     meaning = incidents.exit_meaning(code)
+    if p["type"] == "crash_loop" and code in (0, None):
+        meaning = "it keeps exiting by itself and Docker restarts it"  # never "exited normally" for a crash loop
     summary = {
         "crash_loop": f"{name} keeps crashing and Docker keeps restarting it ({p['detail']}). Exit code {code}: {meaning}.",
         "container_down": f"{name} stopped and didn't come back. Exit code {code}: {meaning}.",
@@ -1020,7 +1207,7 @@ def capture(p):
 
 
 STORE = incidents.Store(DATA_DIR)
-MONITOR = incidents.Monitor(STORE, NTFY, capture)
+MONITOR = incidents.Monitor(STORE, NTFY, capture, error_rule)
 
 
 def seed_mock_incidents():
@@ -1100,8 +1287,12 @@ def monitor_loop():
             except Exception as e:
                 print(f"docker events failed: {str(e)[:120]}", flush=True)
         try:
+            STORE.expire_rules(now)  # finished mutes: their incidents are visible again
             for f in (docker, health_system):  # fresh state for detection
                 _cache.pop(f.__name__, None)
+            for c in (docker().get("containers") or []):  # homelab.ignore=true containers: hide their incidents
+                if c.get("ignored") == "label":
+                    STORE.mark_ignored(-1, "kind='container' AND target=?", (c["name"],))
             MONITOR.tick(important(problems()), now)
         except Exception as e:
             print(f"incident monitor failed: {type(e).__name__}: {str(e)[:160]}", flush=True)
@@ -1137,7 +1328,7 @@ def incident_stats(now=None):
             "top": top, "uptime": 100 * (1 - down / (7 * 86400)), "down_secs": down}
 
 
-def incident_list_page(query):
+def incident_list_page(query, admin="off"):
     q = urllib.parse.parse_qs(query)
     show = (q.get("show") or ["all"])[0]
     rng = (q.get("range") or ["7d"])[0]
@@ -1147,7 +1338,7 @@ def incident_list_page(query):
         open_id = 0
     secs = {"24h": 86400, "7d": 7 * 86400, "30d": 30 * 86400}.get(rng, 7 * 86400)
     items = STORE.list(since=time.time() - secs, status=show if show in ("open", "resolved") else None,
-                       kind="container" if show == "apps" else None)
+                       kind="container" if show == "apps" else None, ignored=show == "ignored")
     if show == "system":
         items = [i for i in items if i["kind"] in ("metric", "system")]
     if open_id and not any(i["id"] == open_id for i in items):  # a deep link always shows its incident
@@ -1155,8 +1346,11 @@ def incident_list_page(query):
         if extra:
             items.append(extra)
     full = {i["id"]: STORE.get(i["id"]) for i in items if i["status"] == "open" or i["id"] == open_id}
+    d = docker()
+    label_ignored = [c["name"] for c in (d.get("containers") or []) if c.get("ignored") == "label"] if ok(d) else []
     return panels.panel_incidents(items, {"show": show, "range": rng}, incident_stats(), full, open_id,
-                                  NTFY.enabled, STORE.persistent)
+                                  NTFY.enabled, STORE.persistent, admin=admin, rules=STORE.rules(),
+                                  label_ignored=label_ignored)
 
 
 def container_logs_page(name):
@@ -1243,9 +1437,10 @@ class Handler(BaseHTTPRequestHandler):
             if path in STATIC:
                 body, ctype = static_file(path)
             elif path == "/panel/incidents":
-                body, ctype = incident_list_page(self.path.partition("?")[2]).encode(), "text/html; charset=utf-8"
+                body = incident_list_page(self.path.partition("?")[2], admin_state(self.headers)).encode()
+                ctype = "text/html; charset=utf-8"
             elif re.fullmatch(r"/panel/incident/\d+", path):
-                body = incident_list_page(f"open={path.rsplit('/', 1)[1]}").encode()
+                body = incident_list_page(f"open={path.rsplit('/', 1)[1]}", admin_state(self.headers)).encode()
                 ctype = "text/html; charset=utf-8"
             elif re.fullmatch(r"/panel/logs/[A-Za-z0-9_.-]{1,128}", path):
                 body, ctype = container_logs_page(path.rsplit("/", 1)[1]).encode(), "text/html; charset=utf-8"
@@ -1269,6 +1464,57 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("X-Content-Type-Options", "nosniff")
         self.end_headers()
         self.wfile.write(body)
+
+    def _json(self, code, obj, cookie=None):
+        body = json.dumps(obj).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        if cookie is not None:
+            self.send_header("Set-Cookie", cookie)
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_POST(self):
+        """Write actions (ignore/mute rules). Need the admin PIN cookie plus a custom header, so other
+        websites can't trigger them (a cross-site request can't add the header without CORS)."""
+        path = self.path.split("?", 1)[0].rstrip("/")
+        if not ADMIN_PIN:
+            return self._json(403, {"error": "read-only: DASHBOARD_ADMIN_PIN is not set"})
+        if self.headers.get("X-Dashboard") != "1" or "application/json" not in (self.headers.get("Content-Type") or ""):
+            return self._json(400, {"error": "bad request"})
+        try:
+            n = int(self.headers.get("Content-Length") or 0)
+            data = json.loads(self.rfile.read(n) if 0 < n <= 4096 else b"{}")
+        except ValueError:
+            return self._json(400, {"error": "bad json"})
+        ip = self.client_address[0]
+        if path == "/api/login":
+            if not pin_attempt_allowed(ip):
+                return self._json(429, {"error": "Too many tries. Wait 15 minutes."})
+            if not check_pin(data.get("pin", "")):
+                pin_failed(ip)
+                time.sleep(0.5)
+                return self._json(401, {"error": "Wrong PIN"})
+            cookie = f"{ADMIN_COOKIE}={issue_token()}; Max-Age={ADMIN_DAYS * 86400}; Path=/; HttpOnly; SameSite=Strict"
+            return self._json(200, {"ok": True}, cookie)
+        if path == "/api/logout":
+            return self._json(200, {"ok": True}, f"{ADMIN_COOKIE}=; Max-Age=0; Path=/; HttpOnly; SameSite=Strict")
+        if admin_state(self.headers) != "on":
+            return self._json(401, {"error": "PIN required"})
+        try:
+            if path == "/api/rules":
+                rid = add_rule_from_incident(int(data.get("incident")), data.get("kind"),
+                                             int(data["hours"]) if data.get("hours") else None)
+                return self._json(200, {"ok": True, "rule": rid})
+            if path == "/api/rules/delete":
+                return self._json(200, {"ok": True, "removed": STORE.delete_rule(int(data.get("rule")))})
+        except (ValueError, TypeError) as e:
+            return self._json(400, {"error": str(e)[:120]})
+        finally:
+            _cache.pop("docker", None)
+        return self._json(404, {"error": "not found"})
 
     def log_message(self, *a):
         pass
