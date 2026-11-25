@@ -18,9 +18,9 @@ DEBOUNCE = 60               # a problem must last this long before it becomes an
 RESOLVE_AFTER = 60          # ...and must be gone this long before the incident is resolved
 DETECTED = {"crash_loop": "Crash loop detected", "container_down": "Down detected", "oom": "Out-of-memory kill detected",
             "unhealthy": "Failing health check detected"}
-REMIND = {"urgent": 3 * 3600, "high": 3 * 3600, "low": 24 * 3600}
-NTFY_PRIORITY = {"urgent": 5, "high": 4, "low": 2}
-NTFY_TAGS = {"urgent": ["rotating_light"], "high": ["warning"], "low": ["information_source"]}
+REMIND = 3 * 3600           # "still happening" reminder interval
+NTFY_PRIORITY = {"urgent": 5, "high": 4}
+NTFY_TAGS = {"urgent": ["rotating_light"], "high": ["warning"]}
 
 # ------------------------------------------------------------------ redaction
 _SECRET_PATTERNS = [
@@ -151,9 +151,27 @@ class Store:
         if not self.persistent:
             print(f"incidents: {data_dir or 'DATA_DIR'} not writable, keeping incidents in memory only", flush=True)
         self.lock = threading.Lock()
+        try:
+            self._open(path)
+        except sqlite3.DatabaseError as e:  # corrupt file: keep it aside for inspection, start a fresh one
+            bad = f"{path}.corrupt-{int(time.time())}"
+            print(f"incidents: database unreadable ({e}); moved to {bad}", flush=True)
+            try:
+                self.db.close()
+            except Exception:
+                pass
+            os.replace(path, bad)
+            self._open(path)
+
+    def close(self):
+        with self.lock:
+            self.db.close()
+
+    def _open(self, path):
         self.db = sqlite3.connect(path or ":memory:", check_same_thread=False, timeout=5)
         self.db.row_factory = sqlite3.Row
         with self.lock:
+            self.db.execute("PRAGMA quick_check").fetchone()
             self.db.execute("PRAGMA temp_store=MEMORY")
             self.db.execute("PRAGMA auto_vacuum=INCREMENTAL")  # takes effect for a new database file
             self.db.executescript("""
@@ -286,6 +304,7 @@ class Store:
             return [(r[0], r[1]) for r in self.db.execute("SELECT id, headline FROM incidents WHERE headline IS NOT NULL AND ignored=0")]
 
     def delete_low(self):
+        """Low-priority incidents from before 1.0 (they're Home-banner-only now): remove quietly."""
         with self.lock:
             n = self.db.execute("DELETE FROM incidents WHERE priority='low'").rowcount
             self.db.execute("DELETE FROM kv WHERE k LIKE 'lowsent:%'")
@@ -306,7 +325,6 @@ class Store:
         cutoff = now - KEEP_DAYS * 86400
         with self.lock:
             self.db.execute("DELETE FROM incidents WHERE status='resolved' AND ended < ?", (cutoff,))
-            self.db.execute("DELETE FROM kv WHERE k LIKE 'lowsent:%' AND CAST(v AS REAL) < ?", (cutoff,))
             self.db.commit()
             if self.persistent:
                 self.db.execute("PRAGMA incremental_vacuum")
@@ -334,16 +352,20 @@ class Notifier:
         req = urllib.request.Request(self.url + "/", data=json.dumps(body).encode(), method="POST",
                                      headers={"Content-Type": "application/json",
                                               "Authorization": f"Bearer {self.token}"})
-        try:
-            with urllib.request.urlopen(req, timeout=10) as r:
-                ok = 200 <= r.status < 300
-            self.last_error = None if ok else f"HTTP {r.status}"
-            return ok
-        except Exception as e:  # never log the token: only the error type/status
-            code = getattr(e, "code", None)
-            self.last_error = f"HTTP {code}" if code else type(e).__name__
-            print(f"ntfy: send failed ({self.last_error})", flush=True)
-            return False
+        for attempt in (1, 2):
+            try:
+                with urllib.request.urlopen(req, timeout=10) as r:
+                    ok = 200 <= r.status < 300
+                self.last_error = None if ok else f"HTTP {r.status}"
+                return ok
+            except Exception as e:  # never log the token: only the error type/status
+                code = getattr(e, "code", None)
+                self.last_error = f"HTTP {code}" if code else type(e).__name__
+                if code or attempt == 2:  # the server answered (bad token, bad topic...): retrying won't help
+                    print(f"ntfy: send failed ({self.last_error})", flush=True)
+                    return False
+                time.sleep(3)
+        return False
 
 
 # ------------------------------------------------------------------ monitor
@@ -366,11 +388,19 @@ class Monitor:
     """
 
     def __init__(self, store, notifier, capture, error_rule=None):
-        self.store, self.notifier, self.capture = store, notifier, capture
+        self.store, self.notifier, self._capture = store, notifier, capture
         self.error_rule = error_rule or (lambda headline: 0)  # -> rule id that ignores this error line, or 0
         self.pending = {}   # key -> first time seen (debounce)
         self.absent = {}    # key -> first time missing (resolve debounce)
         self.last_prune = 0
+
+    def capture(self, p):
+        try:
+            return self._capture(p) or {}
+        except Exception as e:
+            print(f"incidents: capture failed for {p.get('key')}: {type(e).__name__}: {str(e)[:120]}", flush=True)
+            return {"summary": p.get("detail") or p.get("title"), "headline": None,
+                    "evidence": {"capture_error": f"{type(e).__name__}: {str(e)[:160]}"}, "logs": ""}
 
     def _timeline(self, ev, now, text):
         ev.setdefault("timeline", []).append({"ts": now, "text": text})
@@ -379,22 +409,16 @@ class Monitor:
 
     def _notify_open(self, iid, p, cap, now, reminder=False, opened=None):
         pr = p["priority"]
-        if pr == "low":  # low-priority alerts: at most once a day per problem
-            last = float(self.store.kv_get(f"lowsent:{p['key']}", 0) or 0)
-            if now - last < REMIND["low"]:
-                return False
         if reminder:
             title = f"Still happening: {p['title']}"
             msg = f"Open for {fmt_duration(now - opened)}. " + (cap.get("headline") or p.get("detail") or "")
         else:
             title = p["title"]
             msg = (cap.get("headline") + "\n" if cap.get("headline") else "") + (cap.get("summary") or p.get("detail") or "")
-        sent = self.notifier.send(title, msg.strip(), pr, NTFY_TAGS.get(pr, ["warning"]), iid)
-        if sent and pr == "low":
-            self.store.kv_set(f"lowsent:{p['key']}", now)
-        return sent
+        return self.notifier.send(title, msg.strip(), pr, NTFY_TAGS.get(pr, ["warning"]), iid)
 
-    def tick(self, problems, now=None):
+    def tick(self, problems, now=None, hold_kinds=()):
+        """hold_kinds: incident kinds whose data source is down right now; they are never resolved meanwhile."""
         now = now or time.time()
         active = {p["key"]: p for p in problems}
         # new or continuing problems
@@ -411,7 +435,7 @@ class Monitor:
                     fields.update(evidence=ev2, logs=cap.get("logs") or "", last_capture=now,
                                   summary=cap.get("summary") or inc["summary"], headline=cap.get("headline") or inc["headline"])
                     ev = ev2
-                interval = REMIND.get(p["priority"], 3 * 3600)
+                interval = REMIND
                 if not inc.get("ignored") and fields.get("headline") and self.error_rule(fields["headline"]):
                     fields["ignored"] = self.error_rule(fields["headline"])  # its new error line is ignored
                 if inc.get("ignored") or fields.get("ignored"):
@@ -451,7 +475,8 @@ class Monitor:
                 self.pending.pop(key)  # flapped back to normal before the debounce: no incident
         # resolve what has been gone long enough
         for inc in self.store.open_incidents():
-            if inc["key"] in active:
+            if inc["key"] in active or inc["kind"] in hold_kinds:
+                self.absent.pop(inc["key"], None)
                 continue
             gone = self.absent.setdefault(inc["key"], now)
             if now - gone < RESOLVE_AFTER:

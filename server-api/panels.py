@@ -547,6 +547,8 @@ def container_card(c, title, ic, what):
     if c.get("ignored"):
         word = "Running" if c["state"] == "running" else c["state"].capitalize()
         return card(title, ic, big(word, "", None, f'{esc(c.get("status") or "")} {ignored_tag(c)}'), None, what)
+    if c["state"] != "running" and c.get("manual_stop"):
+        return card(title, ic, big("Stopped", "", None, "stopped by you · " + esc(c.get("status") or "")), None, what)
     if c["state"] != "running":
         return card(title, ic, big("Stopped", "", "bad", esc(c.get("status") or "")), "bad", what)
     lv = "warn" if c.get("restarts") else "ok"
@@ -616,6 +618,8 @@ def panel_docker(d):
             st = "Running" + (" (world)" if c.get("world") else "")
         elif c.get("world"):
             clv, st = None, "Stopped (world, managed by MC Panel)"
+        elif c.get("manual_stop"):
+            clv, st = None, "Stopped by you"
         elif c.get("off_ok"):
             clv, st = None, "Stopped (on purpose)"
         else:
@@ -872,7 +876,8 @@ INC_ICON = {"crash_loop": "restart-alert", "container_down": "stop-circle-outlin
             "cpu_hot": "thermometer-alert", "ram_high": "memory", "disk_high": "harddisk", "ssd_hot": "expansion-card",
             "on_battery": "battery-alert", "updates": "package-up", "reboot": "restart", "ssh_failed": "shield-key",
             "firewall_off": "wall-fire", "playit_down": "tunnel", "tracker": "lightning-bolt-circle",
-            "runner_offline": "rocket-launch-outline", "deploy_failed": "rocket-launch-outline"}
+            "runner_offline": "rocket-launch-outline", "deploy_failed": "rocket-launch-outline",
+            "docker_unreachable": "docker"}
 def ignored_tag(c):
     why = {"label": "by Docker label", "mute": "muted", "rule": "ignored"}.get(c.get("ignored"), "ignored")
     return f'<span class="igtag" title="No incidents or alerts for this container">{"muted" if why == "muted" else "ignored"}</span>'
@@ -882,9 +887,7 @@ MUTES = [(1, "1 h"), (8, "8 h"), (24, "24 h"), (168, "7 d")]
 
 
 def inc_menu(inc, admin):
-    """'Ignore…' menu. off: no PIN configured (read-only), locked: ask for the PIN, on: the actions."""
-    if admin == "off":
-        return ""
+    """'Ignore…' menu. locked: ask for the PIN (only when one is set), on: the actions."""
     iid = inc["id"]
     if inc.get("ignored"):
         rid = inc["ignored"]
@@ -920,7 +923,7 @@ def rules_section(rules, label_ignored, admin):
             left = max(0, int(r["until"] - time.time()))
             until = f' · ends in {left // 3600} h {left % 3600 // 60} min' if left >= 3600 else f' · ends in {left // 60} min'
         btn = (f'<button type="button" class="mbtn" data-unrule="{r["id"]}">Un-ignore</button>' if admin == "on"
-               else '<span class="igtag">PIN required</span>' if admin == "locked" else "")
+               else '<span class="igtag">PIN required</span>')
         rows_.append(f'<div class="rrow"><span><b>{esc(r["label"] or r["value"])}</b>'
                      f'<small>{ {"container": "container", "error": "error line", "mute": "mute"}.get(r["kind"], r["kind"])}'
                      f' · since {inc_when(r["created"])}{until}</small></span>{btn}</div>')
@@ -928,10 +931,10 @@ def rules_section(rules, label_ignored, admin):
         rows_.append(f'<div class="rrow"><span><b>Ignore container {esc(name)}</b><small>set by the Docker label '
                      f'<code>homelab.ignore: "true"</code>; remove the label to undo</small></span></div>')
     body = "".join(rows_) or '<p class="empty">Nothing is ignored or muted.</p>'
-    hint = ("" if admin != "off" else '<p class="ex">Read-only: set DASHBOARD_ADMIN_PIN to manage ignores from here. '
-            'You can still ignore a container with the Docker label <code>homelab.ignore: "true"</code>.</p>')
     return (f'<details class="manage" id="manage-ignored" data-keep><summary>Manage ignored ({n})</summary>'
-            f'<div class="rlist">{body}</div>{hint}</details>')
+            f'<div class="rlist">{body}</div></details>')
+
+
 LOG_WINDOW = (8, 4)  # lines shown before/after the error line until "Show all"
 
 
@@ -1010,7 +1013,7 @@ def inc_facts(inc, alerts_on):
     elif not alerts_on:
         alert = fact("Phone alert", "Not configured", None, "set NTFY_URL and NTFY_TOKEN")
     else:
-        alert = fact("Phone alert", "Not sent", None, "low priority: max once a day" if inc["priority"] == "low" else None)
+        alert = fact("Phone alert", "Not sent", None, "ignored" if inc.get("ignored") else None)
     if inc["kind"] == "container":
         from incidents import exit_meaning
         code = ev.get("exit_code")
@@ -1031,8 +1034,7 @@ def inc_facts(inc, alerts_on):
     if inc["kind"] == "system":  # updates, firewall, runner...: no metric facts
         return ('<div class="facts">'
                 + fact("What", ev.get("value") or inc.get("summary") or "—")
-                + fact("Priority", {"urgent": "Urgent", "high": "High", "low": "Low"}.get(inc["priority"], "—"),
-                       None, "phone alert at most once a day" if inc["priority"] == "low" else None)
+                + fact("Priority", {"urgent": "Urgent", "high": "High", "low": "Low"}.get(inc["priority"], "—"))
                 + fact("Started", clock_txt(inc["started"]), None, inc_when(inc["started"]).split(",")[0])
                 + alert + "</div>")
     top = inc_oneline(inc) if (ev.get("top_container_cpu") or ev.get("top_processes")) else "—"
@@ -1130,7 +1132,7 @@ def inc_metric_extra(inc):
     return out
 
 
-def inc_card_full(inc, alerts_on, admin="off"):
+def inc_card_full(inc, alerts_on, admin="locked"):
     open_ = inc["status"] == "open"
     c = (BADC if inc["priority"] != "low" else WARNC) if open_ else (WARNC if inc_minor(inc) else OKC)
     if inc.get("ignored"):
@@ -1154,7 +1156,7 @@ def inc_card_full(inc, alerts_on, admin="off"):
             f'{body}</article>')
 
 
-def inc_card_compact(inc, admin="off"):
+def inc_card_compact(inc, admin="locked"):
     c = WARNC if inc_minor(inc) else OKC
     if inc["status"] == "open":
         c = BADC if inc["priority"] != "low" else WARNC
@@ -1176,7 +1178,7 @@ def stat_tile(title, ic, value, sub, lv=None):
             f'<div class="tv"{colour}>{esc(str(value))}</div><div class="tm">{esc(sub)}</div></div>')
 
 
-def panel_incidents(items, f, stats, full, open_id, alerts_on, persistent, admin="off", rules=(), label_ignored=()):
+def panel_incidents(items, f, stats, full, open_id, alerts_on, persistent, admin="locked", rules=(), label_ignored=()):
     top = stats.get("top")
     up = stats.get("uptime", 100)
     down_min = int(stats.get("down_secs", 0) // 60)

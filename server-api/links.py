@@ -1,13 +1,14 @@
 """Auto-discovered links: every container that publishes a host port becomes a link.
 
 The browser builds each URL from its own hostname plus the host port (see web/app.js), so
-the same links work at home (192.168.31.125) and over Tailscale. Nothing here knows an IP.
+the same links work on the LAN and over a VPN such as Tailscale. Nothing here knows an IP.
 
 Docker labels on a container override everything (all optional):
   homelab.name, homelab.description, homelab.icon (Material Design Icons name),
   homelab.color, homelab.group, homelab.port (host port, if it publishes several),
   homelab.path (e.g. /admin), homelab.scheme (http|https), homelab.hide=true
 """
+import os
 import re
 import time
 
@@ -173,8 +174,8 @@ def discover(containers, inspect, self_id, first_seen, now=None):
     return {"links": links, "worlds": worlds}
 
 
-EXTERNAL = [
-    ("GitHub", "swastik-labs organisation", "https://github.com/swastik-labs", "github", "#e2e8f0"),
+_ORG = os.environ.get("GITHUB_ORG", "")
+EXTERNAL = ([("GitHub", f"{_ORG} organisation", f"https://github.com/{_ORG}", "github", "#e2e8f0")] if _ORG else []) + [
     ("playit.gg", "Tunnel for Minecraft friends", "https://playit.gg", "tunnel", "#34d399"),
     ("Discord", "Bot servers", "https://discord.com/app", "message-text", "#818cf8"),
 ]

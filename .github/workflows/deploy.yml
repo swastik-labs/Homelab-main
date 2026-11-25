@@ -11,26 +11,46 @@ concurrency:
 
 jobs:
   deploy:
-    runs-on: self-hosted   # existing org runner "homelab-laptop"
+    runs-on: self-hosted   # a runner on the server itself (see README: Deploy with GitHub Actions)
     steps:
       - uses: actions/checkout@v4
 
-      - name: Write .env from secrets
+      - name: Test (mock mode)
+        run: |
+          docker run --rm -v "$PWD/server-api:/app:ro" -w /app \
+            -e MOCK=1 -e DATA_DIR=/tmp/data -e PYTHONDONTWRITEBYTECODE=1 \
+            python:3.13-alpine python -m unittest -v test_dashboard
+
+      - name: Write .env from secrets and variables
         env:
+          # secrets
+          DASHBOARD_ADMIN_PIN: ${{ secrets.DASHBOARD_ADMIN_PIN }}
+          NTFY_TOKEN: ${{ secrets.NTFY_TOKEN }}
           IMMICH_API_KEY: ${{ secrets.IMMICH_API_KEY }}
           DASH_GITHUB_TOKEN: ${{ secrets.DASH_GITHUB_TOKEN }}
-          NTFY_URL: ${{ secrets.NTFY_URL }}
-          NTFY_TOKEN: ${{ secrets.NTFY_TOKEN }}
-          DASHBOARD_ADMIN_PIN: ${{ secrets.DASHBOARD_ADMIN_PIN }}
+          # plain settings (Settings -> Secrets and variables -> Actions -> Variables)
+          DASHBOARD_NAME: ${{ vars.DASHBOARD_NAME }}
+          DASHBOARD_PORT: ${{ vars.DASHBOARD_PORT }}
+          TZ: ${{ vars.TZ }}
+          DASHBOARD_PUBLIC_URL: ${{ vars.DASHBOARD_PUBLIC_URL }}
+          IGNORE_STOPPED_CONTAINERS: ${{ vars.IGNORE_STOPPED_CONTAINERS }}
+          NTFY_URL: ${{ vars.NTFY_URL || secrets.NTFY_URL }}
+          NTFY_TOPIC: ${{ vars.NTFY_TOPIC }}
+          IMMICH_URL: ${{ vars.IMMICH_URL }}
+          DASH_GITHUB_ORG: ${{ vars.DASH_GITHUB_ORG }}
+          DASH_GITHUB_RUNNER: ${{ vars.DASH_GITHUB_RUNNER }}
+          ENERGY_DIR: ${{ vars.ENERGY_DIR }}
+          RATE_INR_PER_KWH: ${{ vars.RATE_INR_PER_KWH }}
         run: |
           umask 077
-          {
-            printf 'IMMICH_API_KEY=%s\n' "$IMMICH_API_KEY"
-            printf 'DASH_GITHUB_TOKEN=%s\n' "$DASH_GITHUB_TOKEN"
-            printf 'NTFY_URL=%s\n' "$NTFY_URL"
-            printf 'NTFY_TOKEN=%s\n' "$NTFY_TOKEN"
-            printf 'DASHBOARD_ADMIN_PIN=%s\n' "$DASHBOARD_ADMIN_PIN"
-          } > .env
+          : > .env
+          for k in DASHBOARD_ADMIN_PIN NTFY_TOKEN IMMICH_API_KEY DASH_GITHUB_TOKEN DASHBOARD_NAME DASHBOARD_PORT TZ \
+                   DASHBOARD_PUBLIC_URL IGNORE_STOPPED_CONTAINERS NTFY_URL NTFY_TOPIC IMMICH_URL DASH_GITHUB_ORG \
+                   DASH_GITHUB_RUNNER ENERGY_DIR RATE_INR_PER_KWH; do
+            v="$(printenv "$k" || true)"
+            [ -n "$v" ] && printf '%s=%s\n' "$k" "$v" >> .env
+          done
+          true
 
       - name: Deploy
         run: docker compose up -d --build --remove-orphans

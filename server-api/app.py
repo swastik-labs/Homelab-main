@@ -1,4 +1,4 @@
-"""Read-only JSON API for Homepage customapi widgets. Python stdlib only."""
+"""Homelab dashboard server: serves the page (web/), its panels and a small JSON API. Python stdlib only."""
 import calendar
 import hashlib
 import hmac
@@ -8,8 +8,10 @@ import os
 import random
 import re
 import secrets
+import signal
 import socket
 import sqlite3
+import sys
 import threading
 import time
 import urllib.parse
@@ -22,25 +24,27 @@ import incidents
 import links
 import panels
 
+VERSION = "1.0.0"
 MOCK = os.environ.get("MOCK") == "1"
+NAME = (os.environ.get("DASHBOARD_NAME") or "homelab").strip()[:40]
 HOSTFS = os.environ.get("HOSTFS", "/hostfs")
 PROC = "/proc"
 SYS = "/sys"
-ENERGY_DIR = os.environ.get("ENERGY_DIR", HOSTFS + "/home/swastik/energy-tracker")
+ENERGY_DIR = os.environ.get("ENERGY_DIR", HOSTFS + "/opt/energy-tracker")
 DB_PATH = ENERGY_DIR + "/energy_tracker.db"
 LIVE_PATH = ENERGY_DIR + "/live.json"
 RATE_INR = float(os.environ.get("RATE_INR_PER_KWH", "5"))
 DOCKER_SOCK = "/var/run/docker.sock"
-IMMICH_URL = os.environ.get("IMMICH_URL", "http://192.168.31.125:2283").rstrip("/")
+IMMICH_URL = os.environ.get("IMMICH_URL", "").rstrip("/")
 IMMICH_KEY = os.environ.get("IMMICH_API_KEY", "")
 GH_TOKEN = os.environ.get("DASH_GITHUB_TOKEN", "")
-GH_ORG = os.environ.get("GITHUB_ORG", "swastik-labs")
-GH_RUNNER = os.environ.get("GITHUB_RUNNER", "homelab-laptop")
+GH_ORG = os.environ.get("GITHUB_ORG", "")
+GH_RUNNER = os.environ.get("GITHUB_RUNNER", "")
 DATA_DIR = os.environ.get("DATA_DIR", "/data")
-ADMIN_PIN = (os.environ.get("DASHBOARD_ADMIN_PIN") or "").strip()  # unset: dashboard stays read-only
+ADMIN_PIN = (os.environ.get("DASHBOARD_ADMIN_PIN") or "").strip()  # optional: unset = anyone who can open it may ignore
 NTFY = incidents.Notifier(os.environ.get("NTFY_URL"), os.environ.get("NTFY_TOKEN"),
                           os.environ.get("NTFY_TOPIC") or "server-alerts",
-                          os.environ.get("DASHBOARD_PUBLIC_URL") or "http://192.168.31.125:3000")
+                          os.environ.get("DASHBOARD_PUBLIC_URL") or "")
 
 _cache = {}
 _cache_lock = threading.Lock()
@@ -576,8 +580,9 @@ def docker():
             try:
                 info = docker_get(f"/containers/{c['Id']}/json")
                 item["restarts"] = info.get("RestartCount")
+                item["restart_policy"] = ((info.get("HostConfig") or {}).get("RestartPolicy") or {}).get("Name") or ""
                 stt = info.get("State") or {}
-                item.update(exit_code=stt.get("ExitCode"), oom=bool(stt.get("OOMKilled")))
+                item.update(exit_code=stt.get("ExitCode"), oom=bool(stt.get("OOMKilled")), state_error=stt.get("Error") or None)
                 try:
                     a, b = stt.get("StartedAt") or "", stt.get("FinishedAt") or ""
                     if a[:4] > "0001" and b[:4] > "0001":
@@ -609,11 +614,13 @@ def docker():
                 item["summary"] = item["status"]
             cs.append(item)
         cs.sort(key=lambda x: (x["state"] != "running", x["name"]))
+    events = list(RECENT_EVENTS)
     for c in cs:  # stopped Minecraft worlds (MC Panel) and the manual ignore list are off on purpose
         c["ignored"] = ignored_container(c)  # "label" / "rule" / "mute" / None
         c["oneoff"] = is_oneoff(c)
+        c["manual_stop"] = stopped_by_user(c, events)
         c["off_ok"] = c["state"] != "running" and (c["world"] or c["name"] in IGNORE_STOPPED or bool(c["ignored"])
-                                                    or c["oneoff"])
+                                                    or c["oneoff"] or c["manual_stop"])
     df = docker_df()
     running = sum(1 for c in cs if c["state"] == "running")
     down = [c["name"] for c in cs if c["state"] != "running" and not c["off_ok"]]
@@ -650,9 +657,10 @@ def immich():
     if MOCK:
         return {"photos": 18342, "videos": 611, "usage_bytes": int(96.4e9), "disk_used_percent": 60.7,
                 "disk_free": "92.0 GB", "queue_active": 0, "queue_waiting": random.choice([0, 0, 12])}
-    if not IMMICH_KEY:
+    if not IMMICH_KEY or not IMMICH_URL:
         return {"photos": None, "videos": None, "usage_bytes": None, "disk_used_percent": None,
-                "disk_free": None, "queue_active": None, "queue_waiting": None, "error": "IMMICH_API_KEY not set"}
+                "disk_free": None, "queue_active": None, "queue_waiting": None,
+                "error": "IMMICH_URL / IMMICH_API_KEY not set"}
     h = {"x-api-key": IMMICH_KEY}
     res = {}
     try:
@@ -696,12 +704,12 @@ def github():
                 "last_run_status": "success", "last_run_at": iso(t), "last_run_url": f"https://github.com/{GH_ORG}"}
     out = {"runner": GH_RUNNER, "runner_status": None, "last_run_repo": None, "last_run_workflow": None,
            "last_run_status": None, "last_run_at": None, "last_run_url": None}
-    if not GH_TOKEN:
-        out["error"] = "DASH_GITHUB_TOKEN not set"
+    if not GH_TOKEN or not GH_ORG:
+        out["error"] = "DASH_GITHUB_TOKEN / GITHUB_ORG not set"
         return out
     try:
         runners = gh(f"/orgs/{GH_ORG}/actions/runners?per_page=100").get("runners", [])
-        r = next((x for x in runners if x.get("name") == GH_RUNNER), runners[0] if runners else None)
+        r = next((x for x in runners if x.get("name") == GH_RUNNER), None if GH_RUNNER else (runners[0] if runners else None))
         if r:
             out["runner"] = r.get("name")
             out["runner_status"] = "offline" if r.get("status") != "online" else ("busy" if r.get("busy") else "idle")
@@ -823,15 +831,44 @@ IGNORE_STOPPED = {x.strip() for x in os.environ.get("IGNORE_STOPPED_CONTAINERS",
 
 RECENT_EVENTS = deque(maxlen=500)   # docker events seen by the monitor: {ts, action, name, exit}
 RESTART_SEEN = {}                    # container -> deque[(ts, restart count)]
+_restart_lock = threading.Lock()
+_event_keys = set()                  # de-duplicates events (the events API's second-granular windows overlap)
+
+
+def remember_events(evs):
+    for e in evs:
+        k = (e["ts"], e["action"], e["name"])
+        if k in _event_keys:
+            continue
+        if len(RECENT_EVENTS) == RECENT_EVENTS.maxlen:
+            old = RECENT_EVENTS[0]
+            _event_keys.discard((old["ts"], old["action"], old["name"]))
+        _event_keys.add(k)
+        RECENT_EVENTS.append(e)
+
+
+def stopped_by_user(c, events):
+    """True when an exited container was stopped on purpose (docker stop / kill / compose stop):
+    its restart policy would otherwise have brought it back, or a stop/kill came right before it died."""
+    if c["state"] != "exited" or c.get("state_error") or c.get("oom"):
+        return False  # failed to start (port taken, missing mount...) or killed for memory: that's a real failure
+    if c.get("restart_policy") in ("always", "unless-stopped"):
+        return True
+    mine = [e for e in events if e["name"] == c["name"]]
+    for i in range(len(mine) - 1, -1, -1):
+        if mine[i]["action"] == "die":
+            return any(e["action"] in ("kill", "stop") and mine[i]["ts"] - e["ts"] < 30 for e in mine[:i])
+    return False
 CRASH_WINDOW = 15 * 60
 
 
 def problems():
     """Everything that needs a look, worst first. Drives the Home banner, incidents and phone alerts.
 
-    priority: urgent (app down, crash loop, OOM) / high / low (at most one phone alert a day)."""
+    priority: urgent (app down, crash loop, OOM) / high / low (Home banner only, never an incident or alert)."""
     out = []
     now = time.time()
+    events = list(RECENT_EVENTS)  # the monitor thread appends meanwhile
 
     def add(key, kind, type_, target, level, priority, title, detail, tab, immediate=False, fingerprint=None):
         out.append({"key": key, "kind": kind, "type": type_, "target": target, "level": level, "priority": priority,
@@ -842,14 +879,16 @@ def problems():
     if ok(d):
         for c in d["containers"]:
             name = c["name"]
-            hist = RESTART_SEEN.setdefault(name, deque(maxlen=50))
-            if c.get("restarts") is not None and (not hist or hist[-1][1] != c["restarts"]):
-                hist.append((now, c["restarts"]))
+            with _restart_lock:
+                hist = RESTART_SEEN.setdefault(name, deque(maxlen=50))
+                if c.get("restarts") is not None and (not hist or hist[-1][1] != c["restarts"]):
+                    hist.append((now, c["restarts"]))
+                hist = list(hist)
             older = [r for t, r in hist if now - t > CRASH_WINDOW]
             base = older[-1] if older else (hist[0][1] if hist else 0)
-            restarts_recent = (c.get("restarts") or 0) - base
-            deaths = [e for e in RECENT_EVENTS if e["name"] == name and e["action"] == "die" and now - e["ts"] < CRASH_WINDOW]
-            ooms = [e for e in RECENT_EVENTS if e["name"] == name and e["action"] == "oom" and now - e["ts"] < 600]
+            restarts_recent = max(0, (c.get("restarts") or 0) - base)  # a recreated container starts again at 0
+            deaths = [e for e in events if e["name"] == name and e["action"] == "die" and now - e["ts"] < CRASH_WINDOW]
+            ooms = [e for e in events if e["name"] == name and e["action"] == "oom" and now - e["ts"] < 600]
             if c.get("oneoff") or (c.get("off_ok") and not c.get("ignored")):
                 continue  # one-off `docker run`, stopped MC Panel world or IGNORE_STOPPED_CONTAINERS
             code = last_exit(name, c.get("exit_code"))
@@ -872,6 +911,12 @@ def problems():
             for p in out[mark:]:
                 if c.get("ignored"):
                     p["ignored"] = c["ignored"]  # shown grey on Home, never an incident or alert
+        with _restart_lock:
+            for gone in set(RESTART_SEEN) - {c["name"] for c in d["containers"]}:
+                RESTART_SEEN.pop(gone, None)
+    elif not MOCK:  # can't see the apps: say so instead of showing "All good"
+        add("docker_unreachable", "system", "docker_unreachable", "Docker", BAD, "high", "Can't read Docker",
+            str(d.get("error") or "Docker socket not reachable")[:160], "docker", fingerprint="docker")
     s = health_system()
     s = s if ok(s) else {}
     t = s.get("cpu_temp_c")
@@ -934,7 +979,7 @@ def problems():
 
 def last_exit(name, fallback=None):
     """Exit code of the container's most recent stop (Docker's current state can say 0 while it crash-loops)."""
-    for e in reversed(RECENT_EVENTS):
+    for e in reversed(list(RECENT_EVENTS)):
         if e["name"] == name and e["action"] == "die" and e.get("exit") not in (None, ""):
             try:
                 return int(e["exit"])
@@ -1022,9 +1067,17 @@ def error_rule(headline):
 MUTE_HOURS = {1: "1 h", 8: "8 h", 24: "24 h", 168: "7 days"}
 
 
+def db_id(v):
+    """A row id from a request: a positive int that fits SQLite, else ValueError."""
+    v = int(v)
+    if not 0 < v < 2 ** 62:
+        raise ValueError("bad id")
+    return v
+
+
 def add_rule_from_incident(iid, kind, hours=None):
     """Create an ignore/mute rule from an incident (the server decides what it matches, not the browser)."""
-    inc = STORE.get(iid)
+    inc = STORE.get(db_id(iid))
     if not inc:
         raise ValueError("incident not found")
     now = time.time()
@@ -1092,9 +1145,9 @@ def token_ok(token, now=None):
 
 
 def admin_state(headers):
-    """'off' (no PIN configured), 'locked' or 'on' for this browser."""
+    """'on' (may ignore/mute) or 'locked' (a PIN is set and this browser hasn't entered it)."""
     if not ADMIN_PIN:
-        return "off"
+        return "on"  # no PIN configured: whoever can open the dashboard (your LAN) may use the controls
     for part in (headers.get("Cookie") or "").split(";"):
         k, _, v = part.strip().partition("=")
         if k == ADMIN_COOKIE and token_ok(v):
@@ -1190,9 +1243,7 @@ def capture_container(p):
             logs = incidents.demux_docker_logs(raw)
             now = time.time()
             evs = docker_events(now - 3600, now, name)[-40:]
-            dies = [e for e in evs if e["action"] == "die" and e["exit"] not in (None, "")]
-            if dies:
-                RECENT_EVENTS.extend(e for e in dies if e not in RECENT_EVENTS)
+            remember_events([e for e in evs if e["action"] == "die" and e["exit"] not in (None, "")])
             for e in evs:
                 what = {"die": f"Container stopped (exit {e['exit']})" if e["exit"] is not None else "Container stopped",
                         "oom": "Killed: out of memory", "restart": "Docker restarted it", "start": "Container started",
@@ -1322,13 +1373,14 @@ def monitor_loop():
     if removed:
         print(f"incidents: removed {removed} low-priority incident(s)", flush=True)
     last = time.time() - 60
+    print(f"homelab-dashboard {VERSION}", flush=True)
     print(f"incidents: {'saved in ' + DATA_DIR if STORE.persistent else 'memory only'}; "
           f"phone alerts {'on (topic ' + NTFY.topic + ')' if NTFY.enabled else 'off (NTFY_URL/NTFY_TOKEN not set)'}", flush=True)
     while True:
         now = time.time()
         if not MOCK:
             try:
-                RECENT_EVENTS.extend(docker_events(last, now))
+                remember_events(docker_events(max(last, now - 900), now))  # after an outage: the last 15 min only
                 last = now
             except Exception as e:
                 print(f"docker events failed: {str(e)[:120]}", flush=True)
@@ -1339,10 +1391,40 @@ def monitor_loop():
             for c in (docker().get("containers") or []):  # homelab.ignore=true containers: hide their incidents
                 if c.get("ignored") == "label":
                     STORE.mark_ignored(-1, "kind='container' AND target=?", (c["name"],))
-            MONITOR.tick(incident_problems(), now)
+            hold = set()  # what we can't see right now: keep those incidents open, no false "resolved"
+            if not ok(docker()):
+                hold.add("container")
+            if not ok(health_system()):
+                hold.add("metric")
+            MONITOR.tick(incident_problems(), now, hold_kinds=hold)
+            HEARTBEAT["error"] = None
         except Exception as e:
-            print(f"incident monitor failed: {type(e).__name__}: {str(e)[:160]}", flush=True)
+            HEARTBEAT["error"] = f"{type(e).__name__}: {str(e)[:160]}"
+            print(f"incident monitor failed: {HEARTBEAT['error']}", flush=True)
+        HEARTBEAT["monitor"] = time.time()
         time.sleep(30)
+
+
+HEARTBEAT = {"monitor": time.time(), "started": time.time(), "error": None}
+STUCK_AFTER = 300  # seconds without a monitor loop before the process restarts itself
+
+
+def watchdog():
+    """If the monitor loop hangs (a stuck socket, a deadlock), exit so Docker's restart policy starts us fresh.
+    Docker never restarts a container just for being unhealthy, so this is what actually heals it."""
+    while True:
+        time.sleep(30)
+        if time.time() - HEARTBEAT["monitor"] > STUCK_AFTER:
+            print(f"watchdog: incident monitor stuck for over {STUCK_AFTER} s, restarting", flush=True)
+            os._exit(1)
+
+
+def healthz():
+    """200 while the server answers and the incident monitor keeps ticking; 503 tells Docker to restart us."""
+    age = time.time() - HEARTBEAT["monitor"]
+    ok_ = age < STUCK_AFTER
+    return ok_, {"ok": ok_, "version": VERSION, "monitor_age_s": int(age), "monitor_error": HEARTBEAT["error"],
+                 "alerts": NTFY.enabled, "incidents_saved": STORE.persistent}
 
 
 DOWN_TYPES = ("container_down", "crash_loop", "oom")
@@ -1374,12 +1456,12 @@ def incident_stats(now=None):
             "top": top, "uptime": 100 * (1 - down / (7 * 86400)), "down_secs": down}
 
 
-def incident_list_page(query, admin="off"):
+def incident_list_page(query, admin="locked"):
     q = urllib.parse.parse_qs(query)
     show = (q.get("show") or ["all"])[0]
     rng = (q.get("range") or ["7d"])[0]
     try:
-        open_id = int((q.get("open") or ["0"])[0])
+        open_id = db_id((q.get("open") or ["0"])[0])
     except ValueError:
         open_id = 0
     secs = {"24h": 86400, "7d": 7 * 86400, "30d": 30 * 86400}.get(rng, 7 * 86400)
@@ -1474,18 +1556,28 @@ ROUTES = {
 }
 
 
+SECURITY_HEADERS = (("X-Content-Type-Options", "nosniff"), ("X-Frame-Options", "DENY"),
+                    ("Referrer-Policy", "same-origin"),
+                    ("Content-Security-Policy", "default-src 'self'; img-src 'self' data: https://cdn.jsdelivr.net; "
+                                                "style-src 'self' 'unsafe-inline'; script-src 'self'; "
+                                                "connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'"))
+
+
 class Handler(BaseHTTPRequestHandler):
-    server_version = "server-api"
+    server_version = "homelab-dashboard/" + VERSION
+    sys_version = ""
+    timeout = 30  # a stuck or slow client can't hold a thread forever
 
     def do_GET(self):
         path = self.path.split("?", 1)[0].rstrip("/") or "/"
+        status = 200
         try:
             if path in STATIC:
                 body, ctype = static_file(path)
             elif path == "/panel/incidents":
                 body = incident_list_page(self.path.partition("?")[2], admin_state(self.headers)).encode()
                 ctype = "text/html; charset=utf-8"
-            elif re.fullmatch(r"/panel/incident/\d+", path):
+            elif re.fullmatch(r"/panel/incident/\d{1,15}", path):
                 body = incident_list_page(f"open={path.rsplit('/', 1)[1]}", admin_state(self.headers)).encode()
                 ctype = "text/html; charset=utf-8"
             elif re.fullmatch(r"/panel/logs/[A-Za-z0-9_.-]{1,128}", path):
@@ -1495,48 +1587,55 @@ class Handler(BaseHTTPRequestHandler):
             elif path.startswith("/panel/") and path[7:] in PANEL_RENDERERS:
                 body, ctype = PANEL_RENDERERS[path[7:]]().encode(), "text/html; charset=utf-8"
             elif path == "/healthz":
-                body, ctype = b'{"ok":true}', "application/json"
+                good, info = healthz()
+                status, body, ctype = (200 if good else 503), json.dumps(info).encode(), "application/json"
             elif path in ROUTES:
                 body, ctype = json.dumps(ROUTES[path]()).encode(), "application/json"
             else:
                 self.send_error(404)
                 return
-        except Exception as e:
-            body, ctype = json.dumps({"error": str(e)[:200]}).encode(), "application/json"
-        self.send_response(200)
-        self.send_header("Content-Type", ctype)
-        self.send_header("Content-Length", str(len(body)))
-        self.send_header("Cache-Control", "no-store")
-        self.send_header("X-Content-Type-Options", "nosniff")
-        self.end_headers()
-        self.wfile.write(body)
+        except Exception as e:  # never crash the server: log it and answer 500
+            print(f"GET {path} failed: {type(e).__name__}: {str(e)[:160]}", flush=True)
+            status, body, ctype = 500, json.dumps({"error": f"{type(e).__name__}: {str(e)[:160]}"}).encode(), "application/json"
+        self._send(status, body, ctype)
+
+    def _send(self, status, body, ctype, cookie=None):
+        try:
+            self.send_response(status)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            for k, v in SECURITY_HEADERS:
+                self.send_header(k, v)
+            if cookie is not None:
+                self.send_header("Set-Cookie", cookie)
+            self.end_headers()
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError, TimeoutError):
+            pass  # the browser went away mid-answer
 
     def _json(self, code, obj, cookie=None):
-        body = json.dumps(obj).encode()
-        self.send_response(code)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
-        self.send_header("Cache-Control", "no-store")
-        if cookie is not None:
-            self.send_header("Set-Cookie", cookie)
-        self.end_headers()
-        self.wfile.write(body)
+        self._send(code, json.dumps(obj).encode(), "application/json", cookie)
 
     def do_POST(self):
-        """Write actions (ignore/mute rules). Need the admin PIN cookie plus a custom header, so other
-        websites can't trigger them (a cross-site request can't add the header without CORS)."""
+        """Write actions (ignore/mute rules). Always need a custom header, so other websites can't trigger
+        them (a cross-site request can't add the header without CORS); plus the PIN cookie if a PIN is set."""
         path = self.path.split("?", 1)[0].rstrip("/")
-        if not ADMIN_PIN:
-            return self._json(403, {"error": "read-only: DASHBOARD_ADMIN_PIN is not set"})
         if self.headers.get("X-Dashboard") != "1" or "application/json" not in (self.headers.get("Content-Type") or ""):
             return self._json(400, {"error": "bad request"})
         try:
             n = int(self.headers.get("Content-Length") or 0)
-            data = json.loads(self.rfile.read(n) if 0 < n <= 4096 else b"{}")
+            if n > 4096:
+                return self._json(413, {"error": "too large"})
+            data = json.loads(self.rfile.read(n) if n > 0 else b"{}")
+            if not isinstance(data, dict):
+                raise ValueError
         except ValueError:
             return self._json(400, {"error": "bad json"})
         ip = self.client_address[0]
         if path == "/api/login":
+            if not ADMIN_PIN:
+                return self._json(200, {"ok": True})
             if not pin_attempt_allowed(ip):
                 return self._json(429, {"error": "Too many tries. Wait 15 minutes."})
             if not check_pin(data.get("pin", "")):
@@ -1555,9 +1654,12 @@ class Handler(BaseHTTPRequestHandler):
                                              int(data["hours"]) if data.get("hours") else None)
                 return self._json(200, {"ok": True, "rule": rid})
             if path == "/api/rules/delete":
-                return self._json(200, {"ok": True, "removed": STORE.delete_rule(int(data.get("rule")))})
-        except (ValueError, TypeError) as e:
+                return self._json(200, {"ok": True, "removed": STORE.delete_rule(db_id(data.get("rule")))})
+        except (ValueError, TypeError, KeyError) as e:
             return self._json(400, {"error": str(e)[:120]})
+        except Exception as e:
+            print(f"POST {path} failed: {type(e).__name__}: {str(e)[:160]}", flush=True)
+            return self._json(500, {"error": "server error"})
         finally:
             _cache.pop("docker", None)
         return self._json(404, {"error": "not found"})
@@ -1634,15 +1736,43 @@ STATIC = {"/": ("index.html", "text/html; charset=utf-8"),
           "/favicon.svg": ("favicon.svg", "image/svg+xml")}
 
 
+_static_cache = {}
+
+
 def static_file(path):
-    name, ctype = STATIC[path]  # fixed whitelist: no path traversal possible
-    with open(os.path.join(WEB, name), "rb") as f:
-        return f.read(), ctype
+    if path not in _static_cache:
+        name, ctype = STATIC[path]  # fixed whitelist: no path traversal possible
+        with open(os.path.join(WEB, name), "rb") as f:
+            body = f.read()
+        if name == "index.html":
+            from html import escape
+            body = body.replace(b"{{NAME}}", escape(NAME).encode()).replace(b"{{VERSION}}", VERSION.encode())
+        _static_cache[path] = (body, ctype)
+    return _static_cache[path]
+
+
+def main():
+    port = int(os.environ.get("PORT", "3000"))
+    server = ThreadingHTTPServer(("0.0.0.0", port), Handler)
+    server.daemon_threads = True
+
+    def stop(*_):  # docker stop sends SIGTERM; PID 1 ignores it unless we handle it
+        print("stopping", flush=True)
+        threading.Thread(target=server.shutdown, daemon=True).start()
+    signal.signal(signal.SIGTERM, stop)
+    print(f"homelab-dashboard {VERSION} on :{port} (MOCK={MOCK})", flush=True)
+    threading.Thread(target=sampler, daemon=True).start()
+    threading.Thread(target=monitor_loop, daemon=True).start()
+    threading.Thread(target=watchdog, daemon=True).start()
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.server_close()
+        STORE.close()
+    sys.exit(0)
 
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", "3000"))
-    print(f"server-api on :{port} (MOCK={MOCK})", flush=True)
-    threading.Thread(target=sampler, daemon=True).start()
-    threading.Thread(target=monitor_loop, daemon=True).start()
-    ThreadingHTTPServer(("0.0.0.0", port), Handler).serve_forever()
+    main()

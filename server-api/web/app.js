@@ -1,4 +1,4 @@
-// swastikserver dashboard: hash-routed tabs; each tab is an HTML fragment from /panel/<id>,
+// Homelab dashboard: hash-routed tabs; each tab is an HTML fragment from /panel/<id>,
 // re-fetched every few seconds and swapped in place (no page reloads, no framework).
 // Extra routes: #incidents?show=open&range=7d (remembered), #incidents/<id> (that incident expanded),
 // #logs-<container> (current logs).
@@ -41,7 +41,7 @@
   const clock = (d) => d.toLocaleTimeString([], { hour: "numeric", minute: "2-digit", second: "2-digit" });
 
   // Discovered app links carry only a port; the address is whatever this page was opened with,
-  // so the same links work at home (192.168.31.125) and over Tailscale.
+  // so the same links work on the LAN and over a VPN such as Tailscale.
   function fillLinks(root) {
     const host = location.hostname;
     root.querySelectorAll("a[data-port]").forEach((a) => {
