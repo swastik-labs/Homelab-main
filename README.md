@@ -545,3 +545,7 @@ server-api/
   web/                      # index.html, app.css, app.js, favicon.svg
 .github/workflows/deploy.yml
 ```
+
+## License
+
+[MIT](LICENSE): free to use, change and share, with no warranty.
